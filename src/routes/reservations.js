@@ -1,4 +1,7 @@
+<<<<<<< HEAD
 // src/routes/reservations.js
+=======
+>>>>>>> 0cbdd00 (chore: backend initial import)
 import { Router } from 'express';
 import { v4 as uuid } from 'uuid';
 import { query } from '../db.js';
@@ -28,6 +31,7 @@ async function cleanupExpired() {
 
 router.post('/', requireAuth, async (req, res) => {
   try {
+<<<<<<< HEAD
     // Logs de diagnóstico de autenticação/headers
     console.log('[reservations] origin =', req.headers.origin || '(none)');
     console.log('[reservations] authorization =', req.headers.authorization || '(none)');
@@ -45,6 +49,11 @@ router.post('/', requireAuth, async (req, res) => {
     const { numbers } = req.body || {};
     console.log('[reservations] body.numbers =', numbers);
 
+=======
+    await cleanupExpired();
+
+    const { numbers } = req.body || {};
+>>>>>>> 0cbdd00 (chore: backend initial import)
     if (!Array.isArray(numbers) || numbers.length === 0)
       return res.status(400).json({ error: 'no_numbers' });
 
@@ -60,7 +69,10 @@ router.post('/', requireAuth, async (req, res) => {
     );
     for (const row of checks.rows) {
       if (row.status !== 'available') {
+<<<<<<< HEAD
         console.log('[reservations] número indisponível:', row.n, 'status=', row.status);
+=======
+>>>>>>> 0cbdd00 (chore: backend initial import)
         return res.status(409).json({ error: 'unavailable', n: row.n });
       }
     }
@@ -81,6 +93,7 @@ router.post('/', requireAuth, async (req, res) => {
       [drawId, numbers, id]
     );
 
+<<<<<<< HEAD
     console.log('[reservations] created', {
       reservationId: id,
       userId: req.user.id,
@@ -92,6 +105,11 @@ router.post('/', requireAuth, async (req, res) => {
     res.json({ reservationId: id, drawId, expiresAt });
   } catch (e) {
     console.error('[reservations] error:', e);
+=======
+    res.json({ reservationId: id, drawId, expiresAt });
+  } catch (e) {
+    console.error(e);
+>>>>>>> 0cbdd00 (chore: backend initial import)
     res.status(500).json({ error: 'reserve_failed' });
   }
 });
