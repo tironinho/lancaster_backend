@@ -1,3 +1,4 @@
+// src/routes/reservations.js
 import { Router } from 'express';
 import { v4 as uuid } from 'uuid';
 import { query } from '../db.js';
@@ -27,9 +28,23 @@ async function cleanupExpired() {
 
 router.post('/', requireAuth, async (req, res) => {
   try {
+    // Logs de diagnóstico de autenticação/headers
+    console.log('[reservations] origin =', req.headers.origin || '(none)');
+    console.log('[reservations] authorization =', req.headers.authorization || '(none)');
+    console.log(
+      '[reservations] cookie token/jwt =',
+      (req.cookies && (req.cookies.token || req.cookies.jwt)) || '(none)'
+    );
+    console.log(
+      '[reservations] user (JWT payload) =',
+      req.user ? { id: req.user.id, email: req.user.email } : '(none)'
+    );
+
     await cleanupExpired();
 
     const { numbers } = req.body || {};
+    console.log('[reservations] body.numbers =', numbers);
+
     if (!Array.isArray(numbers) || numbers.length === 0)
       return res.status(400).json({ error: 'no_numbers' });
 
@@ -45,6 +60,7 @@ router.post('/', requireAuth, async (req, res) => {
     );
     for (const row of checks.rows) {
       if (row.status !== 'available') {
+        console.log('[reservations] número indisponível:', row.n, 'status=', row.status);
         return res.status(409).json({ error: 'unavailable', n: row.n });
       }
     }
@@ -65,9 +81,17 @@ router.post('/', requireAuth, async (req, res) => {
       [drawId, numbers, id]
     );
 
+    console.log('[reservations] created', {
+      reservationId: id,
+      userId: req.user.id,
+      drawId,
+      numbers,
+      expiresAt: expiresAt.toISOString(),
+    });
+
     res.json({ reservationId: id, drawId, expiresAt });
   } catch (e) {
-    console.error(e);
+    console.error('[reservations] error:', e);
     res.status(500).json({ error: 'reserve_failed' });
   }
 });
