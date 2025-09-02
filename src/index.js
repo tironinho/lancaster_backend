@@ -1,6 +1,8 @@
+// src/index.js
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+import cookieParser from 'cookie-parser';
 import { ensureSchema } from './seed.js';
 
 import authRoutes from './routes/auth.js';
@@ -13,12 +15,22 @@ const app = express();
 const PORT = Number(process.env.PORT || 4000);
 
 app.use(express.json({ limit: '1mb' }));
+app.use(cookieParser());
+
+// CORS: aceita múltiplas origens (separadas por vírgula) e envia credenciais
 app.use(
   cors({
-    origin: (process.env.CORS_ORIGIN || '*').split(','),
-    credentials: true
+    origin: (process.env.CORS_ORIGIN || 'http://localhost:3000')
+      .split(',')
+      .map((s) => s.trim()),
+    credentials: true,
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    optionsSuccessStatus: 204,
   })
 );
+// garante preflight explícito para qualquer rota da API
+app.options('/api/*', cors());
 
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 

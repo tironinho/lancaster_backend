@@ -1,3 +1,4 @@
+// src/routes/payments.js
 import { Router } from 'express';
 import { MercadoPagoConfig, Payment } from 'mercadopago';
 import { query } from '../db.js';
@@ -8,6 +9,7 @@ const router = Router();
 
 const mpClient = new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN });
 const mpPayment = new Payment(mpClient);
+
 router.post('/pix', requireAuth, async (req, res) => {
   try {
     const { reservationId } = req.body || {};
@@ -34,20 +36,33 @@ router.post('/pix', requireAuth, async (req, res) => {
       .map((n) => n.toString().padStart(2, '0'))
       .join(', ')}`;
 
-    const payment = await mpPayment.create({ body: { 
-      transaction_amount: amount,
-      description,
-      payment_method_id: 'pix',
-      payer: { email: rs.email },
-      external_reference: String(reservationId),
-      notification_url: `${process.env.PUBLIC_URL || `http://localhost:${process.env.PORT || 4000}`}/api/mercadopago/webhook`,
-      date_of_expiration: new Date(Date.now() + 30 * 60 * 1000).toISOString()
-    }, requestOptions: { idempotencyKey: uuidv4() } });
+    const payment = await mpPayment.create({
+      body: {
+        transaction_amount: amount,
+        description,
+        payment_method_id: 'pix',
+        payer: { email: rs.email },
+        external_reference: String(reservationId),
+        notification_url: `${
+          process.env.PUBLIC_URL || `http://localhost:${process.env.PORT || 4000}`
+        }/api/mercadopago/webhook`,
+        date_of_expiration: new Date(Date.now() + 30 * 60 * 1000).toISOString()
+      },
+      requestOptions: { idempotencyKey: uuidv4() }
+    });
 
     const body = payment?.body || payment;
     const { id, status, point_of_interaction } = body;
     const td = point_of_interaction?.transaction_data || {};
-    const { qr_code, qr_code_base64 } = td;
+    let { qr_code, qr_code_base64 } = td;
+
+    // Normaliza: remove quebras de linha e espaços para garantir PNG/BR Code válidos
+    if (typeof qr_code_base64 === 'string') {
+      qr_code_base64 = qr_code_base64.replace(/\s+/g, '');
+    }
+    if (typeof qr_code === 'string') {
+      qr_code = qr_code.replace(/\s+/g, '');
+    }
 
     await query(
       `insert into payments(id, user_id, draw_id, numbers, amount_cents, status, qr_code, qr_code_base64)
@@ -106,7 +121,6 @@ router.get('/:id/status', requireAuth, async (req, res) => {
   }
 });
 
-
 router.post('/webhook', async (req, res) => {
   try {
     const paymentId = req.body?.data?.id || req.query?.id || req.body?.id;
@@ -125,7 +139,10 @@ router.post('/webhook', async (req, res) => {
     const id = String(body.id);
     const status = body.status;
 
-    await query(`update payments set status=$2, paid_at = case when $2='approved' then now() else paid_at end where id=$1`, [id, status]);
+    await query(
+      `update payments set status=$2, paid_at = case when $2='approved' then now() else paid_at end where id=$1`,
+      [id, status]
+    );
 
     if (status === 'approved') {
       const pr = await query(`select draw_id, numbers from payments where id=$1`, [id]);
@@ -136,7 +153,10 @@ router.post('/webhook', async (req, res) => {
           numbers
         ]);
         // Fecha o sorteio quando vender 100
-        const cnt = await query(`select count(*)::int as sold from numbers where draw_id=$1 and status='sold'`, [draw_id]);
+        const cnt = await query(
+          `select count(*)::int as sold from numbers where draw_id=$1 and status='sold'`,
+          [draw_id]
+        );
         if (cnt.rows[0].sold === 100) {
           await query(`update draws set status='closed', closed_at=now() where id=$1`, [draw_id]);
           const newDraw = await query(`insert into draws(status) values('open') returning id`);
