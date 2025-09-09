@@ -6,7 +6,7 @@
  
 ### Testes rápidos (curl)
 ```bash
-# Minha área
+# Minha área 
 curl -s http://localhost:4000/api/me/reservations -H "Authorization: Bearer $TOKEN" | jq .
 
 # Admin
