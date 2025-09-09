@@ -3,7 +3,7 @@
 - **GET `/api/me/reservations`** (auth) → lista reservas do usuário logado
 - **GET `/api/admin/reservations`** (auth + admin) → lista/pagina reservas com filtros
 - **GET `/api/draws/:id/numbers`** → alias para leitura de números por sorteio
-
+ 
 ### Testes rápidos (curl)
 ```bash
 # Minha área
