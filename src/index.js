@@ -1,5 +1,10 @@
 // src/index.js
 import 'dotenv/config';
+import dns from 'dns';
+
+// ⚠️ Força IPv4 antes de qualquer import que possa abrir socket
+try { dns.setDefaultResultOrder('ipv4first'); } catch {}
+
 import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
@@ -49,17 +54,9 @@ app.use((req, res) => {
 
 app.listen(PORT, async () => {
   console.log(`API listening on :${PORT}`);
-
-  // DEBUG: mostra quais envs estão presentes (sem senha)
-  const show = (v) => {
-    try { const u = new URL(v); if (u.password) u.password='***'; return u.toString(); } catch { return !!v; }
-  };
-  console.log('[env] DATABASE_URL:', show(process.env.DATABASE_URL));
-  console.log('[env] DATABASE_URL_POOLING:', show(process.env.DATABASE_URL_POOLING));
-
-  // Warmup do pool pra falhar cedo se algo estiver errado
   try {
-    await getPool();
+    const pool = await getPool();
+    await pool.query('SELECT 1');
     console.log('[db] warmup ok');
   } catch (e) {
     console.error('[db] initial check failed:', e);
