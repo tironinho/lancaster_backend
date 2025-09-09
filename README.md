@@ -1,4 +1,4 @@
-
+ 
 ## Endpoints adicionados (somente leitura)
 - **GET `/api/me/reservations`** (auth) → lista reservas do usuário logado
 - **GET `/api/admin/reservations`** (auth + admin) → lista/pagina reservas com filtros
