@@ -1,5 +1,7 @@
 // src/db/pg.js
 import pg from 'pg';
+export * from "./pg.js";
+export { default } from "./pg.js";
 
 const primary = process.env.DATABASE_URL || process.env.POSTGRES_URL || '';
 const secondary = process.env.DATABASE_URL_POOLING || '';
