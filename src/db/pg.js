@@ -3,21 +3,19 @@ import pg from 'pg';
 import dns from 'dns';
 import { URL } from 'url';
 
-// Força preferência por IPv4 globalmente (Node >= 18)
-try { dns.setDefaultResultOrder('ipv4first'); } catch { /* ignore */ }
+try { dns.setDefaultResultOrder('ipv4first'); } catch {}
 
-// Construímos uma lista de candidatos, em ordem:
-// 1) Session (5432) aws-0   2) Session (5432) aws-1
-// 3) Transaction (6543) aws-0   4) Transaction (6543) aws-1
 const urlsOrdered = [
-  process.env.DATABASE_URL,
-  process.env.DATABASE_URL_ALT,
-  process.env.DATABASE_URL_POOLING,
-  process.env.DATABASE_URL_POOLING_ALT,
+  process.env.DATABASE_URL,           // aws-0:5432 (session)
+  process.env.DATABASE_URL_ALT,       // aws-1:5432 (session)
+  process.env.DATABASE_URL_POOLING,   // aws-0:6543 (transaction)
+  process.env.DATABASE_URL_POOLING_ALT,// aws-1:6543 (transaction)
+  process.env.DATABASE_URL_DIRECT,    // direto db.<ref>:5432 (último recurso)
 ].filter(Boolean);
 
-// SSL: por padrão "require" com CA relaxado (Render às vezes não tem cadeia completa).
-const strict = String(process.env.PGSSLMODE || 'require').toLowerCase().includes('verify');
+const strict = String(process.env.PGSSLMODE || 'require')
+  .toLowerCase()
+  .includes('verify');
 
 function mask(url) {
   try {
@@ -29,10 +27,6 @@ function mask(url) {
   }
 }
 
-/**
- * Resolve o host para IPv4 e monta um config explícito (host/port/user/db)
- * para o pg.Pool, evitando novas resoluções (e quaisquer tentativas em IPv6).
- */
 async function makePgConfig(urlStr) {
   const u = new URL(urlStr);
 
@@ -42,20 +36,16 @@ async function makePgConfig(urlStr) {
   const user = decodeURIComponent(u.username || 'postgres');
   const password = decodeURIComponent(u.password || '');
 
-  // Resolve IPv4 explicitamente e usa o IP literal como host
+  // Resolve para IPv4 literal (evita AAAA / IPv6)
   const { address } = await dns.promises.lookup(host, { family: 4, all: false });
 
   return {
-    host: address,        // ← IP v4 literal
+    host: address,
     port,
     database,
     user,
     password,
-
-    // SSL
     ssl: strict ? { rejectUnauthorized: true } : { rejectUnauthorized: false },
-
-    // Pool
     max: Number(process.env.PG_MAX || 10),
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 10_000,
@@ -76,7 +66,7 @@ async function connectWithRetry(urls, attempt = 1) {
     cfg = await makePgConfig(url);
   } catch (e) {
     console.error(`[pg] DNS/parse failed on ${mask(url)} -> ${e?.code || e?.message}`);
-    if (rest.length === 0 || attempt >= 6) throw e;
+    if (rest.length === 0 || attempt >= 8) throw e;
     await new Promise(r => setTimeout(r, 1000 * attempt));
     return connectWithRetry(rest, attempt + 1);
   }
@@ -84,16 +74,16 @@ async function connectWithRetry(urls, attempt = 1) {
   const candidate = new pg.Pool(cfg);
 
   try {
-    await candidate.query('SELECT 1'); // testa imediatamente
+    await candidate.query('SELECT 1');
     console.log(`[pg] connected on ${mask(url)} (IPv4=${cfg.host}:${cfg.port})`);
     return candidate;
   } catch (err) {
     console.error(
-      `[pg] failed on ${mask(url)} (IPv4=${cfg.host}:${cfg.port}) -> ${err?.code || err?.message}`
+      `[pg] failed on ${mask(url)} (IPv4=${cfg.host}:${cfg.port}) -> ${err?.code || 'ERR'} :: ${err?.message || ''}`
     );
     await candidate.end().catch(() => {});
-    if (rest.length === 0 || attempt >= 6) throw err;
-    await new Promise(r => setTimeout(r, 1000 * attempt)); // backoff incremental
+    if (rest.length === 0 || attempt >= 8) throw err;
+    await new Promise(r => setTimeout(r, 1000 * attempt));
     return connectWithRetry(rest, attempt + 1);
   }
 }
