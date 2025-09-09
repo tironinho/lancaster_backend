@@ -6,14 +6,17 @@ import { URL } from 'url';
 // Força preferência por IPv4 globalmente (Node >= 18)
 try { dns.setDefaultResultOrder('ipv4first'); } catch { /* ignore */ }
 
-// Ordem de tentativa: 5432 (não-pooler) -> 6543 (pooler)
+// Construímos uma lista de candidatos, em ordem:
+// 1) Session (5432) aws-0   2) Session (5432) aws-1
+// 3) Transaction (6543) aws-0   4) Transaction (6543) aws-1
 const urlsOrdered = [
-  process.env.DATABASE_URL,            // ex.: postgres://postgres:***@db.<ref>.supabase.co:5432/postgres?sslmode=require
-  process.env.DATABASE_URL_POOLING,    // ex.: postgres://postgres:***@aws-1-sa-east-1.pooler.supabase.com:6543/postgres?sslmode=require
+  process.env.DATABASE_URL,
+  process.env.DATABASE_URL_ALT,
+  process.env.DATABASE_URL_POOLING,
+  process.env.DATABASE_URL_POOLING_ALT,
 ].filter(Boolean);
 
 // SSL: por padrão "require" com CA relaxado (Render às vezes não tem cadeia completa).
-// Se quiser verificação estrita, defina PGSSLMODE=verify-full.
 const strict = String(process.env.PGSSLMODE || 'require').toLowerCase().includes('verify');
 
 function mask(url) {
@@ -27,8 +30,8 @@ function mask(url) {
 }
 
 /**
- * Resolve o host para IPv4 e retorna um config explícito (host/port/user/db) para o pg.Pool,
- * evitando que o Node faça qualquer resolução extra (e tentando IPv6).
+ * Resolve o host para IPv4 e monta um config explícito (host/port/user/db)
+ * para o pg.Pool, evitando novas resoluções (e quaisquer tentativas em IPv6).
  */
 async function makePgConfig(urlStr) {
   const u = new URL(urlStr);
@@ -73,7 +76,7 @@ async function connectWithRetry(urls, attempt = 1) {
     cfg = await makePgConfig(url);
   } catch (e) {
     console.error(`[pg] DNS/parse failed on ${mask(url)} -> ${e?.code || e?.message}`);
-    if (rest.length === 0 || attempt >= 5) throw e;
+    if (rest.length === 0 || attempt >= 6) throw e;
     await new Promise(r => setTimeout(r, 1000 * attempt));
     return connectWithRetry(rest, attempt + 1);
   }
@@ -89,7 +92,7 @@ async function connectWithRetry(urls, attempt = 1) {
       `[pg] failed on ${mask(url)} (IPv4=${cfg.host}:${cfg.port}) -> ${err?.code || err?.message}`
     );
     await candidate.end().catch(() => {});
-    if (rest.length === 0 || attempt >= 5) throw err;
+    if (rest.length === 0 || attempt >= 6) throw err;
     await new Promise(r => setTimeout(r, 1000 * attempt)); // backoff incremental
     return connectWithRetry(rest, attempt + 1);
   }
