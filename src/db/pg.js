@@ -3,66 +3,79 @@ import pg from 'pg';
 import dns from 'dns';
 import { URL as NodeURL } from 'url';
 
-// ===== 1) Carrega e normaliza ENVs =====
-const basePooler = (process.env.DATABASE_URL_POOLING || '').trim();
-const altPooler  = (process.env.DATABASE_URL_POOLING_ALT || '').trim();
-// Opcional: se quiser manter um direto, deixe aqui (eu sugiro deixar vazio no Render)
-const directDB   = (process.env.DATABASE_URL || '').trim();
+// ===== 1) Lê ENVs com fallback p/ variáveis do Supabase =====
+const env = process.env;
 
-// ===== 2) Expande URLs do pooler para também tentar porta 5432 =====
-function expandPoolerPorts(u) {
-  if (!u) return [];
+// Direto (host db.<proj>.supabase.co:5432)
+const directDB = [
+  env.DATABASE_URL,
+  env.POSTGRES_URL_NON_POOLING, // Supabase "direct"
+].find(v => v && v.trim()) || '';
+
+// Pooler (host *.pooler.supabase.com:6543)
+const basePooler = [
+  env.DATABASE_URL_POOLING,
+  env.POSTGRES_PRISMA_URL,      // pooling (com pgbouncer=true)
+  env.POSTGRES_URL,             // pooling padrão
+].find(v => v && v.trim()) || '';
+
+const altPooler = (env.DATABASE_URL_POOLING_ALT || '').trim();
+
+// ===== 2) Normalização segura das URLs =====
+function normalize(url) {
+  if (!url) return null;
   try {
-    const a = new NodeURL(u);
-    // Sempre incluir o original
-    const out = [a.toString()];
-    // Se for pooler.supabase.com, adiciona fallback na porta 5432
-    if (/pooler\.supabase\.com$/i.test(a.hostname)) {
-      const b = new NodeURL(a.toString());
-      b.port = '5432';
-      out.push(b.toString());
+    const u = new NodeURL(url);
+
+    // Corrige porta se for pooler (sempre 6543)
+    if (/pooler\.supabase\.com$/i.test(u.hostname)) {
+      u.port = '6543';
     }
-    return out;
+
+    // Garante sslmode=require
+    if (!/[?&]sslmode=/.test(u.search)) {
+      u.search += (u.search ? '&' : '?') + 'sslmode=require';
+    }
+    return u.toString();
   } catch {
-    return [u]; // se por algum motivo não parsear, tenta bruto
+    // Se não parsear, tenta bruto assim mesmo
+    return url;
   }
 }
 
-// Ordem pensada: aws-0 6543 → aws-0 5432 → aws-1 6543 → aws-1 5432 → (opcional) direto
-const urls = [
-  ...expandPoolerPorts(basePooler),
-  ...expandPoolerPorts(altPooler),
-  ...(directDB ? [directDB] : []),
-].filter(Boolean);
+// Ordem: direto (5432) → pooler base (6543) → pooler alt (6543)
+const urlsRaw = [directDB, basePooler, altPooler].map(normalize).filter(Boolean);
 
-// ===== 3) SSL: desabilita verificação para qualquer *.supabase.com =====
+// Remove duplicadas preservando ordem
+const seen = new Set();
+const urls = urlsRaw.filter(u => (seen.has(u) ? false : (seen.add(u), true)));
+
+// ===== 3) SSL (no-verify para domínios Supabase) =====
 function sslFor(url) {
   try {
     const u = new NodeURL(url);
-    if (u.hostname.endsWith('.supabase.com')) {
-      // Pooler e hosts db de Supabase frequentemente têm cadeia self-signed
+    if (/\.(supabase\.co|supabase\.com)$/i.test(u.hostname)) {
+      // Evita problemas de cadeia em alguns ambientes
       return { rejectUnauthorized: false };
     }
   } catch {}
-  // Fallback: respeita PGSSLMODE (default require)
-  const mode = String(process.env.PGSSLMODE || 'require').trim().toLowerCase();
+  const mode = String(env.PGSSLMODE || 'require').trim().toLowerCase();
   if (mode === 'disable' || mode === 'allow') return false;
   return { rejectUnauthorized: mode !== 'no-verify' };
 }
 
-// ===== 4) Força IPv4 no socket (mata ENETUNREACH por IPv6) =====
+// ===== 4) Força IPv4 (evita bugs de IPv6 em hosts cloud) =====
 function ipv4Lookup(hostname, opts, cb) {
-  // ADDRCONFIG evita endereços não roteáveis, V4 apenas
   dns.lookup(hostname, { family: 4, hints: dns.ADDRCONFIG }, cb);
 }
 
-// ===== 5) Config comum do pool =====
+// ===== 5) Config do Pool =====
 function cfg(url) {
   return {
     connectionString: url,
     ssl: sslFor(url),
-    lookup: ipv4Lookup, // <- força IPv4 na resolução de DNS/socket
-    max: Number(process.env.PG_MAX || 10),
+    lookup: ipv4Lookup, // repassado ao net/tls pelo pg
+    max: Number(env.PG_MAX || 10),
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 15_000,
     keepAlive: true,
@@ -71,7 +84,6 @@ function cfg(url) {
 
 let pool;
 
-// Apenas sanitiza a URL logada (esconde senha)
 function safe(url) {
   return String(url).replace(/:[^@]+@/, '://***:***@');
 }
