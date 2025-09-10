@@ -36,18 +36,21 @@ async function verifyPassword(plain, hashed) {
   }
 }
 
+// --- mantém imports e variáveis como estão ---
+
 async function findUserByEmail(pool, emailRaw) {
   const email = String(emailRaw).trim();
-
-  // Tenta em múltiplas tabelas/colunas; a que interessa p/ você é a última (users/pass_hash)
   const tries = [
-    // { tabela, colEmail, colHash, colId, exprRole }
+    // tabela, colEmail, colHash, id, roleExpr (ajustado ao seu schema)
+    { table: 'users', colE: 'email', colP: 'pass_hash', colId: 'id', roleExpr: "CASE WHEN is_admin THEN 'admin' ELSE 'user' END" },
     { table: 'admin_users', colE: 'email', colP: 'password_hash', colId: 'id', roleExpr: 'role' },
-    { table: 'admins',      colE: 'email', colP: 'password',      colId: 'id', roleExpr: "'admin'" },
-    // sua tabela principal:
-    { table: 'users',       colE: 'email', colP: 'pass_hash',     colId: 'id', roleExpr: "CASE WHEN is_admin THEN 'admin' ELSE 'user' END" },
+    { table: 'admins', colE: 'email', colP: 'password', colId: 'id', roleExpr: "'admin'" },
   ];
 
+  // ping leve (força reconectar se pool estiver quebrado)
+  await pool.query('SELECT 1');
+
+  let lastErr = null;
   for (const t of tries) {
     try {
       const q = `
@@ -57,19 +60,42 @@ async function findUserByEmail(pool, emailRaw) {
                ${t.roleExpr} AS role
         FROM ${t.table}
         WHERE LOWER(${t.colE}) = LOWER($1)
-        LIMIT 1
-      `;
+        LIMIT 1`;
       const { rows } = await pool.query(q, [email]);
-      if (rows.length) {
-        const u = rows[0];
-        return { id: u.id, email: u.email, hash: u.hash, role: u.role || 'user' };
-      }
-    } catch {
-      // tabela/coluna pode não existir — tenta a próxima
+      if (rows.length) return rows[0];
+    } catch (e) {
+      lastErr = e; // registra erro real de DB
     }
   }
-  return null;
+  if (lastErr) throw lastErr; // <- NÃO mascara como 401
+  return null;                // só null se realmente não achou
 }
+
+router.post('/login', async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+    if (!email || !password) return res.status(400).json({ error: 'invalid_payload' });
+
+    const pool = await getPool();
+    const user = await findUserByEmail(pool, email);
+
+    if (!user || !user.hash) return res.status(401).json({ error: 'invalid_credentials' });
+
+    const ok = user.hash.startsWith('$2')
+      ? await bcrypt.compare(String(password), String(user.hash))
+      : (!user.hash.startsWith('$') && String(password) === String(user.hash));
+
+    if (!ok) return res.status(401).json({ error: 'invalid_credentials' });
+
+    const token = signToken({ sub: user.id, email: user.email, role: user.role || 'user' });
+    res.cookie(/* ...igual estava... */);
+    return res.json({ ok: true, token, user: { id: user.id, email: user.email, role: user.role || 'user' } });
+  } catch (e) {
+    // Se foi erro de banco, devolve 503 (ou 500) para diferenciar de 401
+    console.error('[auth] login error', e.code || e.message || e);
+    return res.status(503).json({ error: 'db_unavailable' });
+  }
+});
 
 // ------------------------------ routes
 router.post('/register', async (req, res) => {
