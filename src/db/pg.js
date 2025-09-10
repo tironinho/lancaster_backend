@@ -1,110 +1,81 @@
-// src/db/pg.js
 import pg from "pg";
+import dns from "dns";
 
+const { Pool } = pg;
 
-/**
- * Monta a lista de URLs de banco. Mantém compatibilidade com as envs que você já usa.
- * Ordem: direto (5432) -> alternativo direto -> pooler (6543) -> alternativo pooler
- * -> compat de projetos antigos (POSTGRES_URL / POSTGRES_URL_NON_POOLING).
- */
-const URLS = [
-  process.env.DATABASE_URL,
-  process.env.DATABASE_URL_ALT,
-  process.env.DATABASE_URL_POOLING,
-  process.env.DATABASE_URL_POOLING_ALT,
-  process.env.POSTGRES_URL,
-  process.env.POSTGRES_URL_NON_POOLING,
+// Garante IPv4 primeiro (mitiga ENETUNREACH mesmo se o painel ignorar NODE_OPTIONS)
+try { dns.setDefaultResultOrder("ipv4first"); } catch {}
+
+// URLs candidatas — prioriza 5432 (session) e depois 6543 (pgBouncer)
+const CANDIDATES = [
+  process.env.DATABASE_URL,               // ex.: pooler/session 5432
+  process.env.DATABASE_URL_ALT,           // ex.: db.supabase.co:5432
+  process.env.POSTGRES_URL,               // compat
+  process.env.POSTGRES_URL_NON_POOLING,   // compat 5432
+  process.env.DATABASE_URL_POOLING,       // pooler 6543
+  process.env.DATABASE_URL_POOLING_ALT,   // pooler 6543 alternativo
 ].filter(Boolean);
 
-/**
- * Mapeia PGSSLMODE para a configuração esperada pelo 'pg'.
- * - 'require' ou 'no-verify'  => criptografa sem validar a cadeia (evita SELF_SIGNED_CERT_IN_CHAIN)
- * - 'verify-ca' / 'verify-full' => valida a cadeia (precisaria de CA configurada)
- * - 'disable' => sem TLS
- */
-function sslFromEnv() {
-  const mode = String(process.env.PGSSLMODE || "require").toLowerCase();
+// SSL: require | no-verify | disable
+const SSLMODE = (process.env.PGSSLMODE || "require").toLowerCase();
+const ssl = SSLMODE === "disable" ? false : { rejectUnauthorized: SSLMODE !== "no-verify" };
 
-  if (mode === "disable" || mode === "off" || mode === "false") return false;
-
-  if (mode === "verify-ca" || mode === "verify-full") {
-    return { rejectUnauthorized: true };
-  }
-
-  // Padrão: 'require' ou 'no-verify' -> TLS sem validação da cadeia
-  return { rejectUnauthorized: false };
-}
-
-function maskUrl(u) {
-  // esconde a senha nos logs
-  return u.replace(/:\/\/([^:]+):[^@]+@/, "://$1:***@");
-}
-
-function cfg(url) {
+function makeCfg(url) {
   return {
     connectionString: url,
-    ssl: sslFromEnv(),
+    ssl,
     max: Number(process.env.PG_MAX || 10),
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 10_000,
+    statement_timeout: 30_000,
     keepAlive: true,
+    application_name: "lancaster_backend",
   };
+}
+
+function normalize(list) {
+  const uniq = Array.from(new Set(list));
+  return uniq.sort((a, b) => (/:5432\b/.test(a) ? 0 : 1) - (/:5432\b/.test(b) ? 0 : 1));
 }
 
 let pool;
 
-/**
- * Tenta conectar em uma URL e retorna um Pool válido.
- * Loga os erros de forma limpa (com senha mascarada).
- */
-async function tryConnect(url, attempt) {
-  const masked = maskUrl(url);
-  console.log(`[pg] trying ${masked} (attempt ${attempt})`);
-  const candidate = new pg.Pool(cfg(url));
+async function connectWithRetry(list, attempt = 1) {
+  const urls = normalize(list);
+  if (!urls.length) throw new Error("All database URLs failed");
 
-  try {
-    await candidate.query("select 1");
-    console.log(`[pg] connected on ${masked}`);
-    return candidate;
-  } catch (err) {
-    const code = err?.code || err?.message || "unknown";
-    const where =
-      err?.address && err?.port ? ` (IPv4=${err.address}:${err.port})` : "";
-    console.log(`[pg] failed on ${masked}${where} -> ${code}`);
-    await candidate.end().catch(() => {});
-    throw err;
-  }
-}
-
-/**
- * Testa em ordem todas as URLs disponíveis, com pequenos backoffs.
- */
-async function connectWithRetry(urls, wave = 1) {
-  if (!urls.length) throw new Error("No database URL available");
-
-  for (let i = 0; i < urls.length; i++) {
+  for (const raw of urls) {
+    const redacted = raw.replace(/:[^@]*@/, ":***@");
+    const p = new Pool(makeCfg(raw));
     try {
-      return await tryConnect(urls[i], wave);
-    } catch (_) {
-      // tenta a próxima URL
+      console.log("[pg] trying %s (attempt %d)", redacted, attempt);
+      await p.query("select 1");
+      console.log("[pg] connected on %s", redacted);
+      return p;
+    } catch (err) {
+      console.log(
+        "[pg] failed on %s -> %s%s",
+        redacted,
+        err.code || err.name || "ERR",
+        err.message ? ` :: ${err.message}` : ""
+      );
+      await p.end().catch(() => {});
     }
   }
 
-  if (wave < 3) {
-    await new Promise((r) => setTimeout(r, 1000 * wave));
-    return connectWithRetry(urls, wave + 1);
-  }
-
-  throw new Error("All database URLs failed");
+  if (attempt >= 3) throw new Error("All database URLs failed");
+  await new Promise((r) => setTimeout(r, Math.min(1000 * attempt, 4000)));
+  return connectWithRetry(urls, attempt + 1);
 }
 
 export async function getPool() {
   if (pool) return pool;
-  pool = await connectWithRetry(URLS);
-  pool.on("error", (e) => {
-    console.error("[pg] pool error", e?.code || e?.message);
-  });
+  pool = await connectWithRetry(CANDIDATES);
+  pool.on("error", (e) => console.error("[pg] pool error", e?.code || e?.message || e));
   return pool;
 }
 
-export default getPool;
+export async function query(text, params) {
+  const p = await getPool();
+  return p.query(text, params);
+}
