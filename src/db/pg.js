@@ -1,27 +1,27 @@
 // src/db/pg.js
 import pg from 'pg';
 
-// ⚙️ Lê e TRIMA todas as URLs (remove espaços/linhas)
+// 🔒 Sempre TRIM nas envs para remover espaços/linhas acidentais
 const urls = [
-  process.env.DATABASE_URL,
-  process.env.DATABASE_URL_POOLING,
-  process.env.DATABASE_URL_POOLING_ALT,
-]
-  .map(u => (u || '').trim())
-  .filter(Boolean);
+  (process.env.DATABASE_URL_POOLING || '').trim(),       // 1ª tentativa (coloque o aws-0 aqui)
+  (process.env.DATABASE_URL_POOLING_ALT || '').trim(),   // 2ª tentativa (aws-1 aqui)
+  (process.env.DATABASE_URL || '').trim(),               // opcional (db.<ref>.supabase.co:5432)
+].filter(Boolean);
 
-// Decide SSL por URL + PGSSLMODE (também trim)
+// SSL seguro: para pooler.supabase.com (porta 6543) forçamos a NÃO verificar o cert (cadeia self-signed).
+// Para hosts "db.<ref>.supabase.co" mantemos verificação (CA pública).
 function sslFor(url) {
+  const isPooler =
+    /pooler\.supabase\.com/i.test(url) || /:6543\b/.test(url);
+
+  if (isPooler) {
+    return { rejectUnauthorized: false };
+  }
+
+  // Para endpoints diretos (5432) respeite PGSSLMODE (padrão "require")
   const mode = String(process.env.PGSSLMODE || 'require').trim().toLowerCase();
-  // Pooler da Supabase (porta 6543) usa cadeia self-signed → não verificar
-  const isPooler = /pooler\.supabase\.com/.test(url) || /:6543\b/.test(url);
-
   if (mode === 'disable' || mode === 'allow') return false;
-
-  return {
-    // força a aceitar o cert do pooler; para demais, respeita PGSSLMODE
-    rejectUnauthorized: isPooler ? false : mode !== 'no-verify',
-  };
+  return { rejectUnauthorized: mode !== 'no-verify' };
 }
 
 function cfg(url) {
@@ -48,7 +48,7 @@ async function tryOnce(url) {
       '[pg] failed on',
       url.replace(/:[^@]+@/, '://***:***@'),
       '->',
-      e.code || e.errno || e.message
+      (e && (e.code || e.errno || e.message)) || e
     );
     await p.end().catch(() => {});
     throw e;
@@ -57,18 +57,15 @@ async function tryOnce(url) {
 
 async function connectWithRetry(list, i = 0) {
   if (i >= list.length) throw new Error('All database URLs failed');
-  try {
-    return await tryOnce(list[i]);
-  } catch {
-    return connectWithRetry(list, i + 1);
-  }
+  try { return await tryOnce(list[i]); }
+  catch { return connectWithRetry(list, i + 1); }
 }
 
 export async function getPool() {
   if (!pool) {
     console.log('[pg] will try', JSON.stringify(urls, null, 2));
     pool = await connectWithRetry(urls);
-    pool.on('error', e => console.error('[pg] pool error', e.code || e.message));
+    pool.on('error', e => console.error('[pg] pool error', (e && (e.code || e.message)) || e));
   }
   return pool;
 }
