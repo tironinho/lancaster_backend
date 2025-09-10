@@ -50,6 +50,11 @@ const urlsRaw = [directDB, basePooler, altPooler].map(normalize).filter(Boolean)
 const seen = new Set();
 const urls = urlsRaw.filter(u => (seen.has(u) ? false : (seen.add(u), true)));
 
+if (urls.length === 0) {
+  console.error('[pg] nenhuma DATABASE_URL* definida');
+}
+
+//
 // ===== 3) SSL (no-verify para domínios Supabase) =====
 function sslFor(url) {
   try {
@@ -64,11 +69,13 @@ function sslFor(url) {
   return { rejectUnauthorized: mode !== 'no-verify' };
 }
 
+//
 // ===== 4) Força IPv4 (evita bugs de IPv6 em hosts cloud) =====
 function ipv4Lookup(hostname, opts, cb) {
   dns.lookup(hostname, { family: 4, hints: dns.ADDRCONFIG }, cb);
 }
 
+//
 // ===== 5) Config do Pool =====
 function cfg(url) {
   return {
@@ -110,18 +117,48 @@ async function connectWithRetry(list, i = 0) {
   }
 }
 
+// ----- Códigos/transientes que merecem recriar conexão e tentar outra vez
+const TRANSIENT_CODES = new Set([
+  '57P01', // admin_shutdown
+  '57P02', // crash_shutdown
+  '57P03', // cannot_connect_now
+  '08006', // connection_failure
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'EPIPE',
+  'ENETUNREACH',
+  'ECONNREFUSED',
+]);
+
 export async function getPool() {
   if (!pool) {
     console.log('[pg] will try', JSON.stringify(urls, null, 2));
     pool = await connectWithRetry(urls);
+
+    // >>> resiliente: se o pool quebrar, força recriação no próximo uso
     pool.on('error', (e) => {
       console.error('[pg] pool error', (e && (e.code || e.message)) || e);
+      pool = null; // <- recria no próximo getPool()
     });
   }
   return pool;
 }
 
+// ===== 6) Query com retry em falhas transitórias =====
 export async function query(text, params) {
-  const p = await getPool();
-  return p.query(text, params);
+  try {
+    const p = await getPool();
+    return await p.query(text, params);
+  } catch (e) {
+    const code = String(e.code || e.errno || '').toUpperCase();
+    const msg = String(e.message || '');
+    if (TRANSIENT_CODES.has(code) || /Connection terminated|read ECONNRESET/i.test(msg)) {
+      // reconecta e tenta 1x
+      console.warn('[pg] transient error, recreating pool and retrying once:', code || msg);
+      pool = null;
+      const p = await getPool();
+      return await p.query(text, params);
+    }
+    throw e;
+  }
 }
