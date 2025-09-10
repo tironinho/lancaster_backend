@@ -1,71 +1,62 @@
 // src/db/pg.js
 import pg from 'pg';
-const { Pool } = pg;
 
-const sslmode = String(process.env.PGSSLMODE || 'require').toLowerCase();
-const SSL =
-  sslmode === 'no-verify'
-    ? { rejectUnauthorized: false }
-    : { rejectUnauthorized: true };
-
-// Monte a lista de URLs em ordem de preferência (pooler primeiro)
-const URLS = [
+const urls = [
+  process.env.DATABASE_URL,
   process.env.DATABASE_URL_POOLING,
   process.env.DATABASE_URL_POOLING_ALT,
-  process.env.POSTGRES_PRISMA_URL,          // às vezes também aponta p/ pooler
-  process.env.POSTGRES_URL,                 // se for pooler, bom ter
-  process.env.DATABASE_URL,                 // 5432 (direto) — fallback
-  process.env.DATABASE_URL_ALT,             // fallback extra
-  process.env.POSTGRES_URL_NON_POOLING,     // 5432 — último recurso
+  // evite incluir POSTGRES_URL se ele apontar para 5432/host direto
 ].filter(Boolean);
 
-function cfg(connectionString) {
+function sslFromEnv() {
+  const mode = (process.env.PGSSLMODE || 'require').toLowerCase();
+  if (mode === 'disable' || mode === 'allow') return false;
+  return { rejectUnauthorized: mode !== 'no-verify' };
+}
+
+function cfg(url) {
   return {
-    connectionString,
-    ssl: SSL,
-    max: Number(process.env.PG_MAX || 2),          // manter baixo no Render free
-    idleTimeoutMillis: 10_000,
-    connectionTimeoutMillis: 10_000,
+    connectionString: url,
+    ssl: sslFromEnv(),
+    max: Number(process.env.PG_MAX || 10),
+    idleTimeoutMillis: 30_000,
+    connectionTimeoutMillis: 12_000,
     keepAlive: true,
-    allowExitOnIdle: false,
   };
 }
 
 let pool;
 
-/** Conecta testando cada URL até achar uma que responde. */
-async function connectWithRetry(urls) {
-  if (!urls.length) throw new Error('All database URLs failed');
-
-  const [url, ...rest] = urls;
-  const candidate = new Pool(cfg(url));
+async function tryOnce(url) {
+  const p = new pg.Pool(cfg(url));
   try {
-    await candidate.query('SELECT 1');
-    console.log('[pg] connected on', mask(url));
-    return candidate;
-  } catch (err) {
-    console.log('[pg] failed on', mask(url), '->', err.code || err.message);
-    await candidate.end().catch(() => {});
-    return connectWithRetry(rest);
+    await p.query('SELECT 1');
+    console.log('[pg] connected on', url.replace(/:[^@]+@/, '://***:***@'));
+    return p;
+  } catch (e) {
+    console.log(
+      '[pg] failed on',
+      url.replace(/:[^@]+@/, '://***:***@'),
+      '->',
+      e.code || e.errno || e.message
+    );
+    await p.end().catch(() => {});
+    throw e;
   }
 }
 
-function mask(u) {
-  try {
-    const out = new URL(u);
-    if (out.username) out.username = '***';
-    if (out.password) out.password = '***';
-    return out.toString();
-  } catch {
-    return u;
-  }
+async function connectWithRetry(list, i = 0) {
+  if (i >= list.length) throw new Error('All database URLs failed');
+  try { return await tryOnce(list[i]); }
+  catch { return connectWithRetry(list, i + 1); }
 }
 
 export async function getPool() {
-  if (pool) return pool;
-  console.log('[pg] will try', JSON.stringify(URLS.map(mask), null, 2));
-  pool = await connectWithRetry(URLS);
-  pool.on('error', (e) => console.error('[pg] pool error', e?.code || e?.message));
+  if (!pool) {
+    console.log('[pg] will try', JSON.stringify(urls, null, 2));
+    pool = await connectWithRetry(urls);
+    pool.on('error', e => console.error('[pg] pool error', e.code || e.message));
+  }
   return pool;
 }
 
