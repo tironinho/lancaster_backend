@@ -1,8 +1,6 @@
 // src/index.js
 import 'dotenv/config';
 import dns from 'dns';
-
-// ⚠️ Força IPv4 antes de qualquer import que possa abrir socket
 try { dns.setDefaultResultOrder('ipv4first'); } catch {}
 
 import express from 'express';
@@ -18,7 +16,7 @@ import drawsRoutes from './routes/draws.js';
 import drawsExtRoutes from './routes/draws_ext.js';
 import adminRoutes from './routes/admin.js';
 
-import { getPool } from './db/pg.js'; // warmup opcional
+import { getPool } from './db/pg.js';
 
 const app = express();
 
