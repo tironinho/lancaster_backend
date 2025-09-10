@@ -1,138 +1,101 @@
-// src/routes/auth.js
-import express from 'express';
-import bcrypt from 'bcryptjs';
+// src/middleware/auth.js
 import jwt from 'jsonwebtoken';
-import { getPool } from '../db/pg.js';
 
-const router = express.Router();
-
-// ---- Config de token/cookie ----
 const JWT_SECRET =
   process.env.JWT_SECRET ||
-  process.env.SUPABASE_JWT_SECRET || // usa a que você já tem no Vercel
+  process.env.SUPABASE_JWT_SECRET ||
   'change-me-in-env';
 
-const TOKEN_TTL = process.env.JWT_TTL || '7d'; // tempo de vida do token
-const COOKIE_NAME = process.env.AUTH_COOKIE_NAME || 'ns_auth';
-const IS_PROD = (process.env.NODE_ENV || process.env.NODE_ENV) === 'production';
+function extractToken(req) {
+  const hdr = req.headers.authorization || '';
+  let token = null;
 
-// Utilitários de token --------------------------------------------------------
-function signToken(payload) {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: TOKEN_TTL });
+  // Authorization: Bearer <jwt>
+  if (/^Bearer\s+/i.test(hdr)) {
+    token = hdr.replace(/^Bearer\s+/i, '').trim();
+  }
+
+  // Cookies (fallback)
+  if (!token && req.cookies) {
+    token = req.cookies.ns_auth || req.cookies.token || req.cookies.jwt || null;
+  }
+
+  // Sanitiza: remove aspas e espaços acidentais
+  if (typeof token === 'string') {
+    token = token.trim();
+    if (
+      (token.startsWith('"') && token.endsWith('"')) ||
+      (token.startsWith("'") && token.endsWith("'"))
+    ) {
+      token = token.slice(1, -1);
+    }
+  }
+
+  return token || null;
 }
 
-function getTokenFromReq(req) {
-  const bearer = req.headers.authorization;
-  if (bearer && bearer.startsWith('Bearer ')) return bearer.slice(7);
-  if (req.cookies && req.cookies[COOKIE_NAME]) return req.cookies[COOKIE_NAME];
-  return null;
+function decodeToken(token) {
+  const data = jwt.verify(token, JWT_SECRET);
+
+  // Normaliza id (aceita sub ou id)
+  const id = typeof data.id !== 'undefined' ? data.id : data.sub;
+
+  // Normaliza flag de admin
+  const is_admin =
+    typeof data.is_admin !== 'undefined'
+      ? !!data.is_admin
+      : typeof data.isAdmin !== 'undefined'
+      ? !!data.isAdmin
+      : (typeof data.role === 'string' && data.role.toLowerCase() === 'admin') ||
+        (typeof data.email === 'string' &&
+         data.email.toLowerCase() === 'admin@newstore.com.br');
+
+  return {
+    id,
+    email: data.email || null,
+    name: data.name || null,
+    is_admin,
+    raw: data,
+  };
 }
 
-function verifyToken(req, res, next) {
+export function requireAuth(req, res, next) {
+  const token = extractToken(req);
+  if (!token) {
+    return res.status(401).json({ error: 'missing_token' });
+  }
   try {
-    const token = getTokenFromReq(req);
-    if (!token) return res.status(401).json({ error: 'unauthorized' });
-    req.user = jwt.verify(token, JWT_SECRET);
+    req.user = decodeToken(token);
     return next();
   } catch (e) {
-    return res.status(401).json({ error: 'unauthorized' });
+    return res.status(401).json({ error: 'invalid_token' });
   }
 }
 
-// Busca usuário por e-mail tentando esquemas comuns ---------------------------
-// Ajuste a ordem/nomes se souber exatamente a sua tabela/colunas.
-async function findUserByEmail(pool, email) {
-  const candidates = [
-    // [tabela, colEmail, colSenha, colId, colRole?]
-    ['admin_users', 'email', 'password_hash', 'id', 'role'],
-    ['admins', 'email', 'password', 'id', 'role'],
-    ['users', 'email', 'password_hash', 'id', 'role'],
-    ['users', 'email', 'password', 'id', 'role'],
-  ];
-
-  for (const [table, cEmail, cPass, cId, cRole] of candidates) {
-    try {
-      const q = `SELECT ${cId} as id, ${cEmail} as email, ${cPass} as hash${cRole ? `, ${cRole} as role` : ''} 
-                 FROM ${table} WHERE ${cEmail} = $1 LIMIT 1`;
-      const { rows } = await pool.query(q, [email]);
-      if (rows.length) {
-        const u = rows[0];
-        return {
-          id: u.id,
-          email: u.email,
-          hash: u.hash,
-          role: u.role || 'user',
-        };
-      }
-    } catch (_) {
-      // ignora erro de tabela/coluna inexistente e tenta a próxima
-    }
-  }
-  return null;
-}
-
-// -----------------------------------------------------------------------------
-
-router.post('/login', async (req, res) => {
+// Não obriga estar logado; apenas popula req.user quando houver token válido
+export function optionalAuth(req, _res, next) {
   try {
-    const { email, password } = req.body || {};
-    if (!email || !password) {
-      return res.status(400).json({ error: 'invalid_payload' });
+    const token = extractToken(req);
+    if (token) {
+      req.user = decodeToken(token);
     }
-
-    const pool = await getPool(); // 🔴 usa o pool compartilhado (NÃO crie Pool novo aqui)
-
-    // Busca usuário
-    const user = await findUserByEmail(pool, String(email).trim().toLowerCase());
-    if (!user || !user.hash) {
-      return res.status(401).json({ error: 'login_failed' });
-    }
-
-    // Confere senha
-    const ok = await bcrypt.compare(String(password), String(user.hash));
-    if (!ok) {
-      return res.status(401).json({ error: 'login_failed' });
-    }
-
-    // Gera token
-    const token = signToken({ sub: user.id, email: user.email, role: user.role });
-
-    // Define cookie httpOnly (e também devolve no body para compatibilidade)
-    res.cookie(COOKIE_NAME, token, {
-      httpOnly: true,
-      secure: IS_PROD,
-      sameSite: IS_PROD ? 'none' : 'lax',
-      maxAge:
-        typeof TOKEN_TTL === 'string' && TOKEN_TTL.endsWith('d')
-          ? parseInt(TOKEN_TTL, 10) * 24 * 60 * 60 * 1000
-          : 7 * 24 * 60 * 60 * 1000, // fallback 7d
-      path: '/',
-    });
-
-    return res.json({
-      ok: true,
-      token, // caso o front use Authorization: Bearer
-      user: { id: user.id, email: user.email, role: user.role },
-    });
-  } catch (e) {
-    console.error('[auth] login error', e);
-    return res.status(500).json({ error: 'login_failed' });
+  } catch {
+    /* ignora erro de token em rotas públicas */
   }
-});
+  next();
+}
 
-router.post('/logout', (_req, res) => {
-  res.clearCookie(COOKIE_NAME, {
-    httpOnly: true,
-    secure: IS_PROD,
-    sameSite: IS_PROD ? 'none' : 'lax',
-    path: '/',
-  });
-  return res.json({ ok: true });
-});
+export function requireAdmin(req, res, next) {
+  const token = extractToken(req);
+  if (!token) return res.status(401).json({ error: 'missing_token' });
 
-// Retorna o usuário autenticado
-router.get('/me', verifyToken, async (req, res) => {
-  return res.json({ ok: true, user: req.user });
-});
-
-export default router;
+  try {
+    req.user = decodeToken(token);
+    if (!req.user.is_admin) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+    return next();
+  } catch {
+    return res.status(401).json({ error: 'invalid_token' });
+  }
+}
