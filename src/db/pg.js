@@ -9,7 +9,7 @@ const env = process.env;
 const clean = (s) =>
   s && typeof s === 'string' ? s.trim().replace(/^['"]+|['"]+$/g, '') : s;
 
-// ===== 1) Coleta URLs (limpando aspas) — pooler + direct (sempre haverá fallback)
+// ===== URLs: pooler + direct (sempre com fallback, a ordem é configurável)
 const poolerURL = [
   clean(env.DATABASE_URL_POOLING),
   clean(env.POSTGRES_PRISMA_URL),
@@ -23,7 +23,6 @@ const directURL = [
   clean(env.POSTGRES_URL_NON_POOLING),
 ].find(Boolean) || '';
 
-// ===== 2) Normaliza (porta correta e sslmode=require)
 function normalize(url) {
   if (!url) return null;
   try {
@@ -38,12 +37,9 @@ function normalize(url) {
   }
 }
 
-// Ordem de tentativa:
-// - default: poolers → direct (fallback real)
-// - se DB_PREFER_DIRECT=1 ou DB_DISABLE_POOLER=1: direct → poolers
+// Ordem configurável:
 const preferDirect =
   env.DB_PREFER_DIRECT === '1' || env.DB_DISABLE_POOLER === '1';
-
 const ordered = preferDirect
   ? [directURL, poolerURL, altPooler]
   : [poolerURL, altPooler, directURL];
@@ -54,11 +50,9 @@ const urlsRaw = ordered.map(normalize).filter(Boolean);
 const seen = new Set();
 const urls = urlsRaw.filter((u) => (seen.has(u) ? false : (seen.add(u), true)));
 
-if (urls.length === 0) {
-  console.error('[pg] nenhuma DATABASE_URL definida nas ENVs');
-}
+if (!urls.length) console.error('[pg] nenhuma DATABASE_URL definida nas ENVs');
 
-// ===== 3) SSL (no-verify para supabase) + SNI (hostname original)
+// ===== SSL + SNI
 function sslFor(url, sniHost) {
   try {
     const u = new NodeURL(url);
@@ -71,8 +65,9 @@ function sslFor(url, sniHost) {
   return { rejectUnauthorized: mode !== 'no-verify', servername: sniHost };
 }
 
-// ===== 4) DNS helpers: tente TODOS os IPv4 do host (evita IP “ruim” da rotação)
+// ===== DNS/IP strategy (configurável)
 const dnp = dns.promises;
+const TRY_ALL_IPS = env.DB_TRY_ALL_IPS !== '0';
 
 async function resolveAllIPv4(host) {
   try {
@@ -80,10 +75,7 @@ async function resolveAllIPv4(host) {
     return Array.isArray(addrs) && addrs.length ? addrs : [];
   } catch {
     try {
-      const { address } = await dnp.lookup(host, {
-        family: 4,
-        hints: dns.ADDRCONFIG,
-      });
+      const { address } = await dnp.lookup(host, { family: 4, hints: dns.ADDRCONFIG });
       return address ? [address] : [];
     } catch {
       return [];
@@ -91,21 +83,15 @@ async function resolveAllIPv4(host) {
   }
 }
 
-/**
- * Para uma URL com hostname, retorna uma lista de objetos:
- *   { url: mesmaURL mas com hostname = IPv4, sni: hostnameOriginal }
- * Um item para cada IPv4 resolvido.
- */
 async function toIPv4Candidates(url) {
   try {
     const u = new NodeURL(url);
     const host = u.hostname;
-    if (!/\.(supabase\.co|supabase\.com)$/i.test(host)) {
+    if (!/\.(supabase\.co|supabase\.com)$/i.test(host) || !TRY_ALL_IPS) {
       return [{ url, sni: undefined }];
     }
     const ips = await resolveAllIPv4(host);
     if (!ips.length) return [{ url, sni: host }];
-
     return ips.map((ip) => {
       const clone = new NodeURL(url);
       clone.hostname = ip;
@@ -116,7 +102,9 @@ async function toIPv4Candidates(url) {
   }
 }
 
-// ===== 5) Pool config
+// ===== Pool config (timeouts curtos)
+const CONN_TIMEOUT_MS = Number(env.DB_CONN_TIMEOUT_MS || 2000);
+
 function cfg(url, sni) {
   return {
     connectionString: url,
@@ -125,7 +113,7 @@ function cfg(url, sni) {
       dns.lookup(hostname, { family: 4, hints: dns.ADDRCONFIG }, cb),
     max: Number(env.PG_MAX || 10),
     idleTimeoutMillis: 30_000,
-    connectionTimeoutMillis: 5_000, // menor p/ fallback mais ágil
+    connectionTimeoutMillis: CONN_TIMEOUT_MS,
     keepAlive: true,
   };
 }
@@ -138,24 +126,17 @@ function safe(url) {
 }
 
 const TRANSIENT_CODES = new Set([
-  '57P01',
-  '57P02',
-  '57P03',
-  '08006',
-  'ECONNRESET',
-  'ETIMEDOUT',
-  'EPIPE',
-  'ENETUNREACH',
-  'ECONNREFUSED',
+  '57P01','57P02','57P03','08006',
+  'ECONNRESET','ETIMEDOUT','EPIPE','ENETUNREACH','ECONNREFUSED',
 ]);
 
 function isTransient(err) {
   const code = String(err.code || err.errno || '').toUpperCase();
-  const msg = String(err.message || '');
+  const msg  = String(err.message || '');
   return TRANSIENT_CODES.has(code) || /Connection terminated|read ECONNRESET/i.test(msg);
 }
 
-// Conecta 1x numa URL tentando TODOS os IPv4 do host
+// Conecta 1x numa URL (ou no número de tentativas configurado)
 async function connectOnce(url) {
   const candidates = await toIPv4Candidates(url);
   let lastErr = null;
@@ -173,23 +154,18 @@ async function connectOnce(url) {
       return p;
     } catch (e) {
       lastErr = e;
-      console.log(
-        '[pg] failed on',
-        safe(c.url),
-        '->',
-        e.code || e.errno || e.message || e
-      );
+      console.log('[pg] failed on', safe(c.url), '->', e.code || e.errno || e.message || e);
       await p.end().catch(() => {});
-      continue;
+      break; // não tenta os outros IPs quando TRY_ALL_IPS=0
     }
   }
   throw lastErr || new Error('All IPv4 candidates failed');
 }
 
-// Backoff por URL
+// Tentativas por URL (configurável)
 async function connectWithRetry(urlList) {
-  const PER_URL_TRIES = 5;
-  const BASE_DELAY = 500;
+  const PER_URL_TRIES = Math.max(1, Number(env.DB_PER_URL_TRIES || 1));
+  const BASE_DELAY = Math.max(0, Number(env.DB_RETRY_BASE_MS || 0));
 
   let lastErr = null;
 
@@ -199,18 +175,9 @@ async function connectWithRetry(urlList) {
         return await connectOnce(url);
       } catch (e) {
         lastErr = e;
-        if (i < PER_URL_TRIES - 1 && isTransient(e)) {
-          const delay = BASE_DELAY * Math.pow(2, i); // 0.5s→1s→2s→4s→8s
-          console.warn(
-            '[pg] transient connect error, retrying',
-            i + 1,
-            'of',
-            PER_URL_TRIES,
-            'in',
-            delay,
-            'ms'
-          );
-          await new Promise((r) => setTimeout(r, delay));
+        // sem backoff por padrão
+        if (i < PER_URL_TRIES - 1 && isTransient(e) && BASE_DELAY > 0) {
+          await new Promise((r) => setTimeout(r, BASE_DELAY));
           continue;
         }
         break; // próxima URL
@@ -221,13 +188,11 @@ async function connectWithRetry(urlList) {
 }
 
 function scheduleReconnect() {
+  if (env.DB_DISABLE_BG_RECONNECT === '1') return; // desliga reconexão
   if (reconnectTimer) return;
+  const PERIOD = Math.max(10000, Number(env.DB_BG_RECONNECT_MS || 15000)); // 15s default
   reconnectTimer = setInterval(async () => {
-    if (pool) {
-      clearInterval(reconnectTimer);
-      reconnectTimer = null;
-      return;
-    }
+    if (pool) { clearInterval(reconnectTimer); reconnectTimer = null; return; }
     try {
       console.warn('[pg] trying background reconnect...');
       pool = await connectWithRetry(urls);
@@ -237,7 +202,7 @@ function scheduleReconnect() {
     } catch (e) {
       console.warn('[pg] background reconnect failed:', e.code || e.message);
     }
-  }, 5_000);
+  }, PERIOD);
 }
 
 export async function getPool() {
@@ -254,18 +219,13 @@ export async function getPool() {
   return pool;
 }
 
-// Query com retry 1x
 export async function query(text, params) {
   try {
     const p = await getPool();
     return await p.query(text, params);
   } catch (e) {
     if (isTransient(e)) {
-      console.warn('[pg] transient query error, recreating pool and retrying once');
-      pool = null;
-      scheduleReconnect();
-      const p = await getPool();
-      return await p.query(text, params);
+      console.warn('[pg] transient query error; not retrying (lean mode)');
     }
     throw e;
   }
