@@ -1,8 +1,8 @@
+// src/routes/auth.js
 import express from 'express';
 import bcrypt from 'bcryptjs';
-import argon2 from 'argon2';
 import jwt from 'jsonwebtoken';
-import { query } from '../db/pg.js';        // <- usa o wrapper com retry
+import { query } from '../db/pg.js';
 import { requireAuth } from '../middleware/auth.js';
 
 const router = express.Router();
@@ -23,18 +23,23 @@ function signToken(payload) {
 async function verifyPassword(plain, hashed) {
   if (!hashed) return false;
   try {
-    if (String(hashed).startsWith('$2')) return await bcrypt.compare(String(plain), String(hashed));   // bcrypt
-    if (String(hashed).startsWith('$argon2')) return await argon2.verify(String(hashed), String(plain)); // argon2
-    if (!String(hashed).startsWith('$')) return String(plain) === String(hashed); // fallback (não recomendado)
+    if (String(hashed).startsWith('$2')) {
+      return await bcrypt.compare(String(plain), String(hashed)); // bcrypt
+    }
+    if (!String(hashed).startsWith('$')) {
+      return String(plain) === String(hashed); // fallback (não recomendado)
+    }
     return false;
   } catch {
     return false;
   }
 }
 
-// Agora TODAS as consultas passam por `query(...)`
 async function findUserByEmail(emailRaw) {
   const email = String(emailRaw).trim();
+
+  // ping leve (força reconexão se o pool estiver quebrado)
+  await query('SELECT 1', []);
 
   const tries = [
     {
@@ -67,9 +72,6 @@ async function findUserByEmail(emailRaw) {
     },
   ];
 
-  // ping leve (força reconexão se pool estiver quebrado)
-  await query('SELECT 1', []);
-
   for (const t of tries) {
     const { rows } = await query(t.q, t.args);
     if (rows.length) return rows[0];
@@ -77,7 +79,6 @@ async function findUserByEmail(emailRaw) {
   return null;
 }
 
-// ------------------------------ routes
 router.post('/register', async (req, res) => {
   try {
     const { name, email, password } = req.body || {};
@@ -113,7 +114,6 @@ router.post('/register', async (req, res) => {
     return res.json({ ok: true, token, user: u });
   } catch (e) {
     console.error('[auth] register error', e.code || e.message || e);
-    // se erro de DB, deixe 503 para o front diferenciar indisponibilidade
     return res.status(503).json({ error: 'db_unavailable' });
   }
 });

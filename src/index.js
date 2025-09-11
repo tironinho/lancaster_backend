@@ -15,6 +15,7 @@ import meRoutes from './routes/me.js';
 import drawsRoutes from './routes/draws.js';
 import drawsExtRoutes from './routes/draws_ext.js';
 import adminRoutes from './routes/admin.js';
+import { query } from './db/pg.js';
 
 import { getPool } from './db/pg.js';
 
@@ -22,6 +23,10 @@ const app = express();
 
 const PORT = process.env.PORT || 4000;
 const ORIGIN = process.env.CORS_ORIGIN || '*';
+
+setInterval(() => {
+  query('SELECT 1').catch(e => console.warn('[health] db ping failed', e.code || e.message));
+}, 60_000);
 
 app.use(cors({
   origin: ORIGIN === '*' ? true : ORIGIN.split(',').map(s => s.trim()),
