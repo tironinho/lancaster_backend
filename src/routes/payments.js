@@ -145,4 +145,20 @@ router.get('/api/payments/:id/status', requireAuth, async (req, res, next) => {
   }
 });
 
+// pegue a reserva e a quantidade de números a partir do array
+const rRes = await query(
+  `select id, user_id, status, array_length(numbers,1)::int as qty
+     from reservations
+    where id = $1`,
+  [reservationId]
+);
+const r = rRes.rows[0];
+if (!r) return res.status(404).json({ error: 'reserva não encontrada' });
+
+// preço unitário: PRICE_CENTS/100 (ex.: 5500 => 55.00)
+const unit = Number(process.env.PRICE_CENTS || 5500) / 100;
+const amount = Number((r.qty * unit).toFixed(2));
+if (!amount) return res.status(400).json({ error: 'valor (amount) não definido' });
+
+
 export default router;

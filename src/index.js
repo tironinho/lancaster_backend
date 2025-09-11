@@ -14,6 +14,7 @@ import meRoutes from './routes/me.js';
 import drawsRoutes from './routes/draws.js';
 import drawsExtRoutes from './routes/draws_ext.js';
 import adminRoutes from './routes/admin.js';
+import dns from 'dns';
 
 import paymentsRouter from './routes/payments.js'; // NOVO router do PIX
 import { query, getPool } from './db/pg.js';
@@ -21,6 +22,8 @@ import { query, getPool } from './db/pg.js';
 const app = express();
 const PORT = process.env.PORT || 4000;
 const ORIGIN = process.env.CORS_ORIGIN || '*';
+
+try { dns.setDefaultResultOrder('ipv4first'); } catch {}
 
 // Middlewares (antes das rotas)
 app.use(cors({
