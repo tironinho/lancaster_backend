@@ -1,7 +1,7 @@
 // src/routes/reservations.js
 import { Router } from 'express';
 import { v4 as uuid } from 'uuid';
-import { query } from '../db.js';
+import { query } from '../db/pg.js';            // <<<< usar o pg.js correto
 import { requireAuth } from '../middleware/auth.js';
 
 const router = Router();
@@ -58,9 +58,7 @@ router.post('/', requireAuth, async (req, res) => {
     }
 
     // Normaliza para inteiros
-    const nums = numbers
-      .map((n) => Number(n))
-      .filter((n) => Number.isInteger(n));
+    const nums = numbers.map(Number).filter(Number.isInteger);
 
     const ttl = Number(process.env.RESERVATION_TTL_MIN || 15);
 
@@ -78,9 +76,7 @@ router.post('/', requireAuth, async (req, res) => {
     );
     for (const row of checks.rows) {
       if (row.status !== 'available') {
-        if (DBG) {
-          console.log('[reservations] número indisponível:', row.n, 'status =', row.status);
-        }
+        if (DBG) console.log('[reservations] indisponível:', row.n, 'status =', row.status);
         return res.status(409).json({ error: 'unavailable', n: row.n });
       }
     }
