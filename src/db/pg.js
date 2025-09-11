@@ -5,20 +5,23 @@ import { URL as NodeURL } from 'url';
 
 const env = process.env;
 
-// ===== 1) Coleta URLs sem mexer em ENV: pooler primeiro, direct só se não houver pooler
+// ===== helpers
+const clean = (s) =>
+  s && typeof s === 'string' ? s.trim().replace(/^['"]+|['"]+$/g, '') : s;
+
+// ===== 1) Coleta URLs (limpando aspas) — pooler + direct (sempre haverá fallback)
 const poolerURL = [
-  env.DATABASE_URL_POOLING,
-  env.POSTGRES_PRISMA_URL,
-  env.POSTGRES_URL,
-].find(v => v && v.trim()) || '';
+  clean(env.DATABASE_URL_POOLING),
+  clean(env.POSTGRES_PRISMA_URL),
+  clean(env.POSTGRES_URL),
+].find(Boolean) || '';
 
-const altPooler = (env.DATABASE_URL_POOLING_ALT || '').trim();
+const altPooler = clean(env.DATABASE_URL_POOLING_ALT || '');
+
 const directURL = [
-  env.DATABASE_URL,
-  env.POSTGRES_URL_NON_POOLING,
-].find(v => v && v.trim()) || '';
-
-const HAS_POOLER = Boolean(poolerURL || altPooler);
+  clean(env.DATABASE_URL),
+  clean(env.POSTGRES_URL_NON_POOLING),
+].find(Boolean) || '';
 
 // ===== 2) Normaliza (porta correta e sslmode=require)
 function normalize(url) {
@@ -27,21 +30,29 @@ function normalize(url) {
     const u = new NodeURL(url);
     if (/pooler\.supabase\.com$/i.test(u.hostname)) u.port = '6543';
     if (/\.supabase\.co$/i.test(u.hostname) && !u.port) u.port = '5432';
-    if (!/[?&]sslmode=/.test(u.search)) u.search += (u.search ? '&' : '?') + 'sslmode=require';
+    if (!/[?&]sslmode=/.test(u.search))
+      u.search += (u.search ? '&' : '?') + 'sslmode=require';
     return u.toString();
   } catch {
     return url;
   }
 }
 
-// Ordem final: poolers → (direct apenas se não houver pooler)
-const urlsRaw = (HAS_POOLER ? [poolerURL, altPooler] : [directURL])
-  .map(normalize)
-  .filter(Boolean);
+// Ordem de tentativa:
+// - default: poolers → direct (fallback real)
+// - se DB_PREFER_DIRECT=1 ou DB_DISABLE_POOLER=1: direct → poolers
+const preferDirect =
+  env.DB_PREFER_DIRECT === '1' || env.DB_DISABLE_POOLER === '1';
+
+const ordered = preferDirect
+  ? [directURL, poolerURL, altPooler]
+  : [poolerURL, altPooler, directURL];
+
+const urlsRaw = ordered.map(normalize).filter(Boolean);
 
 // remove duplicadas preservando ordem
 const seen = new Set();
-const urls = urlsRaw.filter(u => (seen.has(u) ? false : (seen.add(u), true)));
+const urls = urlsRaw.filter((u) => (seen.has(u) ? false : (seen.add(u), true)));
 
 if (urls.length === 0) {
   console.error('[pg] nenhuma DATABASE_URL definida nas ENVs');
@@ -65,14 +76,14 @@ const dnp = dns.promises;
 
 async function resolveAllIPv4(host) {
   try {
-    // resolve4 retorna todos os A records
     const addrs = await dnp.resolve4(host);
-    // fallback de sanidade
     return Array.isArray(addrs) && addrs.length ? addrs : [];
   } catch {
-    // se falhar, tente lookup (pega 1 IP)
     try {
-      const { address } = await dnp.lookup(host, { family: 4, hints: dns.ADDRCONFIG });
+      const { address } = await dnp.lookup(host, {
+        family: 4,
+        hints: dns.ADDRCONFIG,
+      });
       return address ? [address] : [];
     } catch {
       return [];
@@ -90,13 +101,12 @@ async function toIPv4Candidates(url) {
     const u = new NodeURL(url);
     const host = u.hostname;
     if (!/\.(supabase\.co|supabase\.com)$/i.test(host)) {
-      // para hosts fora do supabase, não mexe
       return [{ url, sni: undefined }];
     }
     const ips = await resolveAllIPv4(host);
     if (!ips.length) return [{ url, sni: host }];
 
-    return ips.map(ip => {
+    return ips.map((ip) => {
       const clone = new NodeURL(url);
       clone.hostname = ip;
       return { url: clone.toString(), sni: host };
@@ -111,11 +121,11 @@ function cfg(url, sni) {
   return {
     connectionString: url,
     ssl: sslFor(url, sni),
-    // lookup ainda força IPv4 se pg precisar resolver algo internamente
-    lookup: (hostname, _opts, cb) => dns.lookup(hostname, { family: 4, hints: dns.ADDRCONFIG }, cb),
+    lookup: (hostname, _opts, cb) =>
+      dns.lookup(hostname, { family: 4, hints: dns.ADDRCONFIG }, cb),
     max: Number(env.PG_MAX || 10),
     idleTimeoutMillis: 30_000,
-    connectionTimeoutMillis: 10_000, // um pouco menor p/ girar entre IPs
+    connectionTimeoutMillis: 5_000, // menor p/ fallback mais ágil
     keepAlive: true,
   };
 }
@@ -128,13 +138,20 @@ function safe(url) {
 }
 
 const TRANSIENT_CODES = new Set([
-  '57P01','57P02','57P03','08006',
-  'ECONNRESET','ETIMEDOUT','EPIPE','ENETUNREACH','ECONNREFUSED',
+  '57P01',
+  '57P02',
+  '57P03',
+  '08006',
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'EPIPE',
+  'ENETUNREACH',
+  'ECONNREFUSED',
 ]);
 
 function isTransient(err) {
   const code = String(err.code || err.errno || '').toUpperCase();
-  const msg  = String(err.message || '');
+  const msg = String(err.message || '');
   return TRANSIENT_CODES.has(code) || /Connection terminated|read ECONNRESET/i.test(msg);
 }
 
@@ -156,9 +173,13 @@ async function connectOnce(url) {
       return p;
     } catch (e) {
       lastErr = e;
-      console.log('[pg] failed on', safe(c.url), '->', e.code || e.errno || e.message || e);
+      console.log(
+        '[pg] failed on',
+        safe(c.url),
+        '->',
+        e.code || e.errno || e.message || e
+      );
       await p.end().catch(() => {});
-      // tenta o próximo IP imediatamente
       continue;
     }
   }
@@ -180,8 +201,16 @@ async function connectWithRetry(urlList) {
         lastErr = e;
         if (i < PER_URL_TRIES - 1 && isTransient(e)) {
           const delay = BASE_DELAY * Math.pow(2, i); // 0.5s→1s→2s→4s→8s
-          console.warn('[pg] transient connect error, retrying', i + 1, 'of', PER_URL_TRIES, 'in', delay, 'ms');
-          await new Promise(r => setTimeout(r, delay));
+          console.warn(
+            '[pg] transient connect error, retrying',
+            i + 1,
+            'of',
+            PER_URL_TRIES,
+            'in',
+            delay,
+            'ms'
+          );
+          await new Promise((r) => setTimeout(r, delay));
           continue;
         }
         break; // próxima URL
@@ -194,7 +223,11 @@ async function connectWithRetry(urlList) {
 function scheduleReconnect() {
   if (reconnectTimer) return;
   reconnectTimer = setInterval(async () => {
-    if (pool) { clearInterval(reconnectTimer); reconnectTimer = null; return; }
+    if (pool) {
+      clearInterval(reconnectTimer);
+      reconnectTimer = null;
+      return;
+    }
     try {
       console.warn('[pg] trying background reconnect...');
       pool = await connectWithRetry(urls);
@@ -209,7 +242,7 @@ function scheduleReconnect() {
 
 export async function getPool() {
   if (!pool) {
-    console.log('[pg] will try', JSON.stringify(urls, null, 2));
+    console.log('[pg] will try', JSON.stringify(urls.map(safe), null, 2));
     try {
       pool = await connectWithRetry(urls);
     } catch (e) {
