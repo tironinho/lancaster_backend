@@ -38,9 +38,8 @@ function normalize(url) {
 }
 
 // Ordem configurável:
-const preferDirect =
-  env.DB_PREFER_DIRECT === '1' || env.DB_DISABLE_POOLER === '1';
-const onlyDirect = env.DB_ONLY_DIRECT === '1';
+const preferDirect = env.DB_PREFER_DIRECT === '1' || env.DB_DISABLE_POOLER === '1';
+const onlyDirect   = env.DB_ONLY_DIRECT === '1';
 
 const ordered = onlyDirect
   ? [directURL]
@@ -67,26 +66,27 @@ function sslFor(url, sniHost) {
   return { rejectUnauthorized: mode !== 'no-verify', servername: sniHost };
 }
 
-// ===== DNS/IP strategy — força IPv4 para Supabase (evita ENETUNREACH em IPv6)
+// ===== DNS/IP — força IPv4 para Supabase
 const dnp = dns.promises;
+const OVERRIDE_IPV4 = clean(env.DB_HOST_IPV4 || ''); // <<< NOVO
 
-async function resolveAllIPv4(host) {
+async function resolveOneIPv4(host) {
   try {
     const addrs = await dnp.resolve4(host);
-    return Array.isArray(addrs) && addrs.length ? addrs : [];
+    if (Array.isArray(addrs) && addrs.length) return addrs[0];
   } catch {
     try {
       const { address } = await dnp.lookup(host, { family: 4, hints: dns.ADDRCONFIG });
-      return address ? [address] : [];
-    } catch {
-      return [];
-    }
+      if (address) return address;
+    } catch {}
   }
+  return null;
 }
 
 /**
- * Sempre que o host for Supabase, trocamos o hostname por UM IPv4 (primeiro A record)
- * e mantemos SNI com o host original. Assim evitamos tentativas IPv6 e o erro ENETUNREACH.
+ * Para hosts do Supabase:
+ * - se DB_HOST_IPV4 definido -> usa esse IP (sem consultar DNS)
+ * - senão -> resolve 1 IPv4; se falhar, NÃO volta pro hostname (evita IPv6)
  */
 async function toIPv4Candidates(url) {
   try {
@@ -95,25 +95,33 @@ async function toIPv4Candidates(url) {
     if (!/\.(supabase\.co|supabase\.com)$/i.test(host)) {
       return [{ url, sni: undefined }];
     }
-    const ips = await resolveAllIPv4(host);
-    const ip = ips[0];
-    if (!ip) return [{ url, sni: host }]; // fallback: mantém hostname
+
+    let ip = OVERRIDE_IPV4;
+    if (!ip) ip = await resolveOneIPv4(host);
+
+    if (!ip) {
+      const msg = `[pg] nenhum IPv4 encontrado para ${host}. Defina DB_HOST_IPV4 com um A record válido.`;
+      console.error(msg);
+      throw new Error('NO_IPV4_SUPABASE');
+    }
+
     const clone = new NodeURL(url);
     clone.hostname = ip; // força IPv4
-    return [{ url: clone.toString(), sni: host }];
-  } catch {
-    return [{ url, sni: undefined }];
+    return [{ url: clone.toString(), sni: host }]; // mantém SNI
+  } catch (e) {
+    // se algo der muito errado, ainda assim evite cair no IPv6
+    throw e instanceof Error ? e : new Error('IPV4_RESOLVE_FAILED');
   }
 }
 
-// ===== Pool config (timeouts curtos)
+// ===== Pool config
 const CONN_TIMEOUT_MS = Number(env.DB_CONN_TIMEOUT_MS || 2000);
 
 function cfg(url, sni) {
   return {
     connectionString: url,
     ssl: sslFor(url, sni),
-    // ainda força IPv4 em qualquer resolução interna
+    // força IPv4 em qualquer resolução interna
     lookup: (hostname, _opts, cb) =>
       dns.lookup(hostname, { family: 4, hints: dns.ADDRCONFIG }, cb),
     max: Number(env.PG_MAX || 10),
@@ -141,7 +149,7 @@ function isTransient(err) {
   return TRANSIENT_CODES.has(code) || /Connection terminated|read ECONNRESET/i.test(msg);
 }
 
-// Conecta 1x numa URL (ou no número de tentativas configurado)
+// Conecta 1x numa URL
 async function connectOnce(url) {
   const candidates = await toIPv4Candidates(url);
   let lastErr = null;
@@ -161,13 +169,13 @@ async function connectOnce(url) {
       lastErr = e;
       console.log('[pg] failed on', safe(c.url), '->', e.code || e.errno || e.message || e);
       await p.end().catch(() => {});
-      break; // 1 IP apenas (evita loops)
+      break;
     }
   }
   throw lastErr || new Error('All IPv4 candidates failed');
 }
 
-// Tentativas por URL (configurável)
+// Tentativas por URL (curtas)
 async function connectWithRetry(urlList) {
   const PER_URL_TRIES = Math.max(1, Number(env.DB_PER_URL_TRIES || 1));
   const BASE_DELAY = Math.max(0, Number(env.DB_RETRY_BASE_MS || 0));
@@ -194,7 +202,7 @@ async function connectWithRetry(urlList) {
 function scheduleReconnect() {
   if (env.DB_DISABLE_BG_RECONNECT === '1') return; // desliga reconexão
   if (reconnectTimer) return;
-  const PERIOD = Math.max(10000, Number(env.DB_BG_RECONNECT_MS || 15000)); // 15s default
+  const PERIOD = Math.max(10000, Number(env.DB_BG_RECONNECT_MS || 15000));
   reconnectTimer = setInterval(async () => {
     if (pool) { clearInterval(reconnectTimer); reconnectTimer = null; return; }
     try {

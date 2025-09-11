@@ -1,2 +1,2 @@
 // src/db.js
-export { getPool, query } from './db/pg.js';
+export { query, getPool } from './db/pg.js';
