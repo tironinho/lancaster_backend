@@ -9,7 +9,7 @@ const env = process.env;
 const clean = (s) =>
   s && typeof s === 'string' ? s.trim().replace(/^['"]+|['"]+$/g, '') : s;
 
-// ===== URLs: pooler + direct (sempre com fallback, a ordem é configurável)
+// ===== URLs: pooler + direct (com fallback configurável)
 const poolerURL = [
   clean(env.DATABASE_URL_POOLING),
   clean(env.POSTGRES_PRISMA_URL),
@@ -40,9 +40,11 @@ function normalize(url) {
 // Ordem configurável:
 const preferDirect =
   env.DB_PREFER_DIRECT === '1' || env.DB_DISABLE_POOLER === '1';
-const ordered = preferDirect
-  ? [directURL, poolerURL, altPooler]
-  : [poolerURL, altPooler, directURL];
+const onlyDirect = env.DB_ONLY_DIRECT === '1';
+
+const ordered = onlyDirect
+  ? [directURL]
+  : (preferDirect ? [directURL, poolerURL, altPooler] : [poolerURL, altPooler, directURL]);
 
 const urlsRaw = ordered.map(normalize).filter(Boolean);
 
@@ -65,9 +67,8 @@ function sslFor(url, sniHost) {
   return { rejectUnauthorized: mode !== 'no-verify', servername: sniHost };
 }
 
-// ===== DNS/IP strategy (configurável)
+// ===== DNS/IP strategy — força IPv4 para Supabase (evita ENETUNREACH em IPv6)
 const dnp = dns.promises;
-const TRY_ALL_IPS = env.DB_TRY_ALL_IPS !== '0';
 
 async function resolveAllIPv4(host) {
   try {
@@ -83,20 +84,23 @@ async function resolveAllIPv4(host) {
   }
 }
 
+/**
+ * Sempre que o host for Supabase, trocamos o hostname por UM IPv4 (primeiro A record)
+ * e mantemos SNI com o host original. Assim evitamos tentativas IPv6 e o erro ENETUNREACH.
+ */
 async function toIPv4Candidates(url) {
   try {
     const u = new NodeURL(url);
     const host = u.hostname;
-    if (!/\.(supabase\.co|supabase\.com)$/i.test(host) || !TRY_ALL_IPS) {
+    if (!/\.(supabase\.co|supabase\.com)$/i.test(host)) {
       return [{ url, sni: undefined }];
     }
     const ips = await resolveAllIPv4(host);
-    if (!ips.length) return [{ url, sni: host }];
-    return ips.map((ip) => {
-      const clone = new NodeURL(url);
-      clone.hostname = ip;
-      return { url: clone.toString(), sni: host };
-    });
+    const ip = ips[0];
+    if (!ip) return [{ url, sni: host }]; // fallback: mantém hostname
+    const clone = new NodeURL(url);
+    clone.hostname = ip; // força IPv4
+    return [{ url: clone.toString(), sni: host }];
   } catch {
     return [{ url, sni: undefined }];
   }
@@ -109,6 +113,7 @@ function cfg(url, sni) {
   return {
     connectionString: url,
     ssl: sslFor(url, sni),
+    // ainda força IPv4 em qualquer resolução interna
     lookup: (hostname, _opts, cb) =>
       dns.lookup(hostname, { family: 4, hints: dns.ADDRCONFIG }, cb),
     max: Number(env.PG_MAX || 10),
@@ -156,7 +161,7 @@ async function connectOnce(url) {
       lastErr = e;
       console.log('[pg] failed on', safe(c.url), '->', e.code || e.errno || e.message || e);
       await p.end().catch(() => {});
-      break; // não tenta os outros IPs quando TRY_ALL_IPS=0
+      break; // 1 IP apenas (evita loops)
     }
   }
   throw lastErr || new Error('All IPv4 candidates failed');
@@ -175,7 +180,6 @@ async function connectWithRetry(urlList) {
         return await connectOnce(url);
       } catch (e) {
         lastErr = e;
-        // sem backoff por padrão
         if (i < PER_URL_TRIES - 1 && isTransient(e) && BASE_DELAY > 0) {
           await new Promise((r) => setTimeout(r, BASE_DELAY));
           continue;
