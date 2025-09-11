@@ -13,7 +13,6 @@ const poolerURL = [
 ].find(v => v && v.trim()) || '';
 
 const altPooler = (env.DATABASE_URL_POOLING_ALT || '').trim();
-
 const directURL = [
   env.DATABASE_URL,
   env.POSTGRES_URL_NON_POOLING,
@@ -26,8 +25,8 @@ function normalize(url) {
   if (!url) return null;
   try {
     const u = new NodeURL(url);
-    if (/pooler\.supabase\.com$/i.test(u.hostname)) u.port = '6543';   // pooler sempre 6543
-    if (/\.supabase\.co$/i.test(u.hostname) && !u.port) u.port = '5432'; // direct padrão 5432
+    if (/pooler\.supabase\.com$/i.test(u.hostname)) u.port = '6543';
+    if (/\.supabase\.co$/i.test(u.hostname) && !u.port) u.port = '5432';
     if (!/[?&]sslmode=/.test(u.search)) u.search += (u.search ? '&' : '?') + 'sslmode=require';
     return u.toString();
   } catch {
@@ -35,7 +34,7 @@ function normalize(url) {
   }
 }
 
-// Ordem final: (pooler → altPooler) OU (direct sozinho se não houver pooler)
+// Ordem final: poolers → (direct apenas se não houver pooler)
 const urlsRaw = (HAS_POOLER ? [poolerURL, altPooler] : [directURL])
   .map(normalize)
   .filter(Boolean);
@@ -61,33 +60,62 @@ function sslFor(url, sniHost) {
   return { rejectUnauthorized: mode !== 'no-verify', servername: sniHost };
 }
 
-// ===== 4) Resolve IPv4 de verdade (evita conexões IPv6 que dão ENETUNREACH)
+// ===== 4) DNS helpers: tente TODOS os IPv4 do host (evita IP “ruim” da rotação)
 const dnp = dns.promises;
-async function toIPv4URL(url) {
+
+async function resolveAllIPv4(host) {
   try {
-    const u = new NodeURL(url);
-    // Força apenas p/ domínios do Supabase
-    if (!/\.(supabase\.co|supabase\.com)$/i.test(u.hostname)) return { url, sni: undefined };
-    const { address } = await dnp.lookup(u.hostname, { family: 4, hints: dns.ADDRCONFIG });
-    const originalHost = u.hostname;
-    u.hostname = address; // passa IP v4 literal
-    // mantém porta/user/pass/db/query
-    return { url: u.toString(), sni: originalHost };
+    // resolve4 retorna todos os A records
+    const addrs = await dnp.resolve4(host);
+    // fallback de sanidade
+    return Array.isArray(addrs) && addrs.length ? addrs : [];
   } catch {
-    return { url, sni: undefined };
+    // se falhar, tente lookup (pega 1 IP)
+    try {
+      const { address } = await dnp.lookup(host, { family: 4, hints: dns.ADDRCONFIG });
+      return address ? [address] : [];
+    } catch {
+      return [];
+    }
   }
 }
 
-// ===== 5) Config do Pool
+/**
+ * Para uma URL com hostname, retorna uma lista de objetos:
+ *   { url: mesmaURL mas com hostname = IPv4, sni: hostnameOriginal }
+ * Um item para cada IPv4 resolvido.
+ */
+async function toIPv4Candidates(url) {
+  try {
+    const u = new NodeURL(url);
+    const host = u.hostname;
+    if (!/\.(supabase\.co|supabase\.com)$/i.test(host)) {
+      // para hosts fora do supabase, não mexe
+      return [{ url, sni: undefined }];
+    }
+    const ips = await resolveAllIPv4(host);
+    if (!ips.length) return [{ url, sni: host }];
+
+    return ips.map(ip => {
+      const clone = new NodeURL(url);
+      clone.hostname = ip;
+      return { url: clone.toString(), sni: host };
+    });
+  } catch {
+    return [{ url, sni: undefined }];
+  }
+}
+
+// ===== 5) Pool config
 function cfg(url, sni) {
   return {
     connectionString: url,
     ssl: sslFor(url, sni),
-    // lookup não é mais crucial pois já trocamos host por IPv4, mas manter não atrapalha:
+    // lookup ainda força IPv4 se pg precisar resolver algo internamente
     lookup: (hostname, _opts, cb) => dns.lookup(hostname, { family: 4, hints: dns.ADDRCONFIG }, cb),
     max: Number(env.PG_MAX || 10),
     idleTimeoutMillis: 30_000,
-    connectionTimeoutMillis: 15_000,
+    connectionTimeoutMillis: 10_000, // um pouco menor p/ girar entre IPs
     keepAlive: true,
   };
 }
@@ -99,10 +127,9 @@ function safe(url) {
   return String(url).replace(/:[^@]+@/, '://***:***@');
 }
 
-// Erros transitórios que merecem retry
 const TRANSIENT_CODES = new Set([
-  '57P01','57P02','57P03','08006',   // PG
-  'ECONNRESET','ETIMEDOUT','EPIPE','ENETUNREACH','ECONNREFUSED', // Node
+  '57P01','57P02','57P03','08006',
+  'ECONNRESET','ETIMEDOUT','EPIPE','ENETUNREACH','ECONNREFUSED',
 ]);
 
 function isTransient(err) {
@@ -111,28 +138,34 @@ function isTransient(err) {
   return TRANSIENT_CODES.has(code) || /Connection terminated|read ECONNRESET/i.test(msg);
 }
 
-// Conecta 1x numa URL (resolvendo IPv4 e mantendo SNI)
+// Conecta 1x numa URL tentando TODOS os IPv4 do host
 async function connectOnce(url) {
-  const { url: v4url, sni } = await toIPv4URL(url);
-  const p = new pg.Pool(cfg(v4url, sni));
-  try {
-    await p.query('SELECT 1');
-    console.log('[pg] connected on', safe(v4url));
-    // Se o pool quebrar depois, recriaremos
-    p.on('error', (e) => {
-      console.error('[pg] pool error', e.code || e.message || e);
-      pool = null;
-      scheduleReconnect();
-    });
-    return p;
-  } catch (e) {
-    console.log('[pg] failed on', safe(v4url), '->', e.code || e.errno || e.message || e);
-    await p.end().catch(() => {});
-    throw e;
+  const candidates = await toIPv4Candidates(url);
+  let lastErr = null;
+
+  for (const c of candidates) {
+    const p = new pg.Pool(cfg(c.url, c.sni));
+    try {
+      await p.query('SELECT 1');
+      console.log('[pg] connected on', safe(c.url));
+      p.on('error', (e) => {
+        console.error('[pg] pool error', e.code || e.message || e);
+        pool = null;
+        scheduleReconnect();
+      });
+      return p;
+    } catch (e) {
+      lastErr = e;
+      console.log('[pg] failed on', safe(c.url), '->', e.code || e.errno || e.message || e);
+      await p.end().catch(() => {});
+      // tenta o próximo IP imediatamente
+      continue;
+    }
   }
+  throw lastErr || new Error('All IPv4 candidates failed');
 }
 
-// Tenta conectar com backoff por URL (5 tentativas por URL)
+// Backoff por URL
 async function connectWithRetry(urlList) {
   const PER_URL_TRIES = 5;
   const BASE_DELAY = 500;
@@ -146,19 +179,18 @@ async function connectWithRetry(urlList) {
       } catch (e) {
         lastErr = e;
         if (i < PER_URL_TRIES - 1 && isTransient(e)) {
-          const delay = BASE_DELAY * Math.pow(2, i); // 0.5s → 1s → 2s → 4s → 8s
+          const delay = BASE_DELAY * Math.pow(2, i); // 0.5s→1s→2s→4s→8s
           console.warn('[pg] transient connect error, retrying', i + 1, 'of', PER_URL_TRIES, 'in', delay, 'ms');
           await new Promise(r => setTimeout(r, delay));
           continue;
         }
-        break; // vai para a próxima URL
+        break; // próxima URL
       }
     }
   }
   throw lastErr || new Error('All database URLs failed');
 }
 
-// Agenda tentativas periódicas até reconectar
 function scheduleReconnect() {
   if (reconnectTimer) return;
   reconnectTimer = setInterval(async () => {
@@ -182,7 +214,6 @@ export async function getPool() {
       pool = await connectWithRetry(urls);
     } catch (e) {
       console.error('[pg] initial connect failed:', e.code || e.message);
-      // não derruba o processo; agenda reconexão e propaga erro
       scheduleReconnect();
       throw e;
     }
@@ -190,7 +221,7 @@ export async function getPool() {
   return pool;
 }
 
-// ===== 6) Query com retry 1x em falha transitória
+// Query com retry 1x
 export async function query(text, params) {
   try {
     const p = await getPool();
