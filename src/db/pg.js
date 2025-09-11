@@ -5,15 +5,15 @@ import { URL as NodeURL } from 'url';
 
 const env = process.env;
 
-// ===== helpers
+// helpers
 const clean = (s) =>
   s && typeof s === 'string' ? s.trim().replace(/^['"]+|['"]+$/g, '') : s;
 
-// ===== URLs: pooler + direct (com fallback configurável)
+// URLs: pooler + direct (ordem configurável)
 const poolerURL = [
   clean(env.DATABASE_URL_POOLING),
   clean(env.POSTGRES_PRISMA_URL),
-  clean(env.POSTGRES_URL),
+  clean(env.POSTGRES_URL), // alguns projetos usam isso p/ pooler
 ].find(Boolean) || '';
 
 const altPooler = clean(env.DATABASE_URL_POOLING_ALT || '');
@@ -27,17 +27,19 @@ function normalize(url) {
   if (!url) return null;
   try {
     const u = new NodeURL(url);
-    if (/pooler\.supabase\.com$/i.test(u.hostname)) u.port = '6543';
+    // NÃO force porta do pooler; use a que vier do dashboard (5432 session, 6543 transaction)
+    // Se for supabase .co sem porta (caso raro), assume 5432
     if (/\.supabase\.co$/i.test(u.hostname) && !u.port) u.port = '5432';
-    if (!/[?&]sslmode=/.test(u.search))
+    if (!/[?&]sslmode=/.test(u.search)) {
       u.search += (u.search ? '&' : '?') + 'sslmode=require';
+    }
     return u.toString();
   } catch {
     return url;
   }
 }
 
-// Ordem configurável:
+// ordem: pooler → (direct como fallback)
 const preferDirect = env.DB_PREFER_DIRECT === '1' || env.DB_DISABLE_POOLER === '1';
 const onlyDirect   = env.DB_ONLY_DIRECT === '1';
 
@@ -53,7 +55,7 @@ const urls = urlsRaw.filter((u) => (seen.has(u) ? false : (seen.add(u), true)));
 
 if (!urls.length) console.error('[pg] nenhuma DATABASE_URL definida nas ENVs');
 
-// ===== SSL + SNI
+// SSL + SNI
 function sslFor(url, sniHost) {
   try {
     const u = new NodeURL(url);
@@ -66,62 +68,12 @@ function sslFor(url, sniHost) {
   return { rejectUnauthorized: mode !== 'no-verify', servername: sniHost };
 }
 
-// ===== DNS/IP — força IPv4 para Supabase
-const dnp = dns.promises;
-const OVERRIDE_IPV4 = clean(env.DB_HOST_IPV4 || ''); // <<< NOVO
-
-async function resolveOneIPv4(host) {
-  try {
-    const addrs = await dnp.resolve4(host);
-    if (Array.isArray(addrs) && addrs.length) return addrs[0];
-  } catch {
-    try {
-      const { address } = await dnp.lookup(host, { family: 4, hints: dns.ADDRCONFIG });
-      if (address) return address;
-    } catch {}
-  }
-  return null;
-}
-
-/**
- * Para hosts do Supabase:
- * - se DB_HOST_IPV4 definido -> usa esse IP (sem consultar DNS)
- * - senão -> resolve 1 IPv4; se falhar, NÃO volta pro hostname (evita IPv6)
- */
-async function toIPv4Candidates(url) {
-  try {
-    const u = new NodeURL(url);
-    const host = u.hostname;
-    if (!/\.(supabase\.co|supabase\.com)$/i.test(host)) {
-      return [{ url, sni: undefined }];
-    }
-
-    let ip = OVERRIDE_IPV4;
-    if (!ip) ip = await resolveOneIPv4(host);
-
-    if (!ip) {
-      const msg = `[pg] nenhum IPv4 encontrado para ${host}. Defina DB_HOST_IPV4 com um A record válido.`;
-      console.error(msg);
-      throw new Error('NO_IPV4_SUPABASE');
-    }
-
-    const clone = new NodeURL(url);
-    clone.hostname = ip; // força IPv4
-    return [{ url: clone.toString(), sni: host }]; // mantém SNI
-  } catch (e) {
-    // se algo der muito errado, ainda assim evite cair no IPv6
-    throw e instanceof Error ? e : new Error('IPV4_RESOLVE_FAILED');
-  }
-}
-
-// ===== Pool config
+// força IPv4 em qualquer resolução interna
 const CONN_TIMEOUT_MS = Number(env.DB_CONN_TIMEOUT_MS || 2000);
-
 function cfg(url, sni) {
   return {
     connectionString: url,
     ssl: sslFor(url, sni),
-    // força IPv4 em qualquer resolução interna
     lookup: (hostname, _opts, cb) =>
       dns.lookup(hostname, { family: 4, hints: dns.ADDRCONFIG }, cb),
     max: Number(env.PG_MAX || 10),
@@ -149,33 +101,30 @@ function isTransient(err) {
   return TRANSIENT_CODES.has(code) || /Connection terminated|read ECONNRESET/i.test(msg);
 }
 
-// Conecta 1x numa URL
+// aqui não trocamos hostname por IP: o pooler já entrega IPv4
 async function connectOnce(url) {
-  const candidates = await toIPv4Candidates(url);
   let lastErr = null;
-
-  for (const c of candidates) {
-    const p = new pg.Pool(cfg(c.url, c.sni));
-    try {
-      await p.query('SELECT 1');
-      console.log('[pg] connected on', safe(c.url));
-      p.on('error', (e) => {
-        console.error('[pg] pool error', e.code || e.message || e);
-        pool = null;
-        scheduleReconnect();
-      });
-      return p;
-    } catch (e) {
-      lastErr = e;
-      console.log('[pg] failed on', safe(c.url), '->', e.code || e.errno || e.message || e);
-      await p.end().catch(() => {});
-      break;
-    }
+  // usa SNI = host original
+  let sni = null;
+  try { sni = new NodeURL(url).hostname; } catch {}
+  const p = new pg.Pool(cfg(url, sni));
+  try {
+    await p.query('SELECT 1');
+    console.log('[pg] connected on', safe(url));
+    p.on('error', (e) => {
+      console.error('[pg] pool error', e.code || e.message || e);
+      pool = null;
+      scheduleReconnect();
+    });
+    return p;
+  } catch (e) {
+    lastErr = e;
+    console.log('[pg] failed on', safe(url), '->', e.code || e.errno || e.message || e);
+    await p.end().catch(() => {});
   }
-  throw lastErr || new Error('All IPv4 candidates failed');
+  throw lastErr || new Error('connect failed');
 }
 
-// Tentativas por URL (curtas)
 async function connectWithRetry(urlList) {
   const PER_URL_TRIES = Math.max(1, Number(env.DB_PER_URL_TRIES || 1));
   const BASE_DELAY = Math.max(0, Number(env.DB_RETRY_BASE_MS || 0));
@@ -192,7 +141,7 @@ async function connectWithRetry(urlList) {
           await new Promise((r) => setTimeout(r, BASE_DELAY));
           continue;
         }
-        break; // próxima URL
+        break;
       }
     }
   }
@@ -200,7 +149,7 @@ async function connectWithRetry(urlList) {
 }
 
 function scheduleReconnect() {
-  if (env.DB_DISABLE_BG_RECONNECT === '1') return; // desliga reconexão
+  if (env.DB_DISABLE_BG_RECONNECT === '1') return;
   if (reconnectTimer) return;
   const PERIOD = Math.max(10000, Number(env.DB_BG_RECONNECT_MS || 15000));
   reconnectTimer = setInterval(async () => {
