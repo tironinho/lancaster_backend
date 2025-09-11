@@ -4,7 +4,7 @@
 - **GET `/api/admin/reservations`** (auth + admin) → lista/pagina reservas com filtros
 - **GET `/api/draws/:id/numbers`** → alias para leitura de números por sorteio
 
-### Testes rápidos (curl)
+### Testes rápidos (curl) 
 ```bash
 # Minha área
 curl -s http://localhost:4000/api/me/reservations -H "Authorization: Bearer $TOKEN" | jq .
