@@ -3,14 +3,14 @@ import pg from 'pg';
 import dns from 'dns';
 import { URL as NodeURL } from 'url';
 
-// ====== única fonte de verdade: DATABASE_URL (use o POOLER 5432 no Render)
+// Use APENAS DATABASE_URL (no Render aponte para o pooler 5432 ou 6543)
 const RAW_URL = (process.env.DATABASE_URL || '').replace(/^['"]|['"]$/g, '');
 if (!RAW_URL) console.error('[pg] DATABASE_URL ausente');
 
 function sslFor(url) {
   try {
     const { hostname } = new NodeURL(url);
-    // Supabase: ignora cadeia self-signed e mantém SNI correto
+    // Supabase: SNI correto e sem exigir cadeia de CA (evita SELF_SIGNED_CERT_IN_CHAIN)
     if (/\.(supabase\.co|supabase\.com)$/i.test(hostname)) {
       return { rejectUnauthorized: false, servername: hostname };
     }
@@ -23,7 +23,7 @@ function sslFor(url) {
 const poolCfg = {
   connectionString: RAW_URL,
   ssl: sslFor(RAW_URL),
-  // Render é IPv4-only: força resoluções em IPv4
+  // Render é IPv4-only
   lookup: (hostname, _opts, cb) =>
     dns.lookup(hostname, { family: 4, hints: dns.ADDRCONFIG }, cb),
   max: Number(process.env.PG_MAX || 10),

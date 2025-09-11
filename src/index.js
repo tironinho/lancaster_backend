@@ -50,10 +50,7 @@ app.use((req, res) => {
   res.status(404).json({ error: 'not_found', path: req.originalUrl });
 });
 
-// DB health ping
-setInterval(() => {
-  query('SELECT 1').catch(e => console.warn('[health] db ping failed', e.code || e.message));
-}, 60_000);
+
 
 app.listen(PORT, async () => {
   console.log(`API listening on :${PORT}`);
