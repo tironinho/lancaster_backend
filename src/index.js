@@ -1,8 +1,8 @@
 // src/index.js
 import 'dotenv/config';
-import * as nodeDns from 'dns';
+
 import { runDbDialSelfTest } from './debug/netcheck.js';
-try { nodeDns.setDefaultResultOrder?.('ipv4first'); } catch {}
+
 
 import express from 'express';
 import cors from 'cors';

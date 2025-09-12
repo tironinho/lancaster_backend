@@ -1,6 +1,5 @@
 // src/db/pg.js
 import pg from 'pg';
-import dns from 'dns';
 import { URL as NodeURL } from 'url';
 
 const env = process.env;
@@ -33,49 +32,47 @@ try {
   warn('Não consegui parsear DATABASE_URL:', e.message);
 }
 
-// depois de: parsed = new NodeURL(RAW_URL)
-log('DB target -> host:', parsed.hostname, 'port:', parsed.port || 5432, 'path:', parsed.pathname);
+// Limpa sslmode da URL e extrai host/porta só para log
+let CLEAN_URL = RAW_URL;
+let HOSTNAME = null;
+let PORT = null;
+try {
+  const u = new NodeURL(RAW_URL);
+  u.searchParams.delete('sslmode');   // evita conflito com objeto ssl abaixo
+  CLEAN_URL = u.toString();
+  HOSTNAME = u.hostname;
+  PORT = u.port || '5432';
+} catch {}
 
-function sslFor(url) {
-  const mode = String(env.PGSSLMODE || 'require').trim().toLowerCase();
-  let servername = null;
-  try { servername = new NodeURL(url).hostname; } catch {}
-  // Supabase: manter SNI e evitar chain error
-  if (/\.(supabase\.co|supabase\.com)$/i.test(servername || '')) {
-    const cfg = { rejectUnauthorized: false, servername };
-    cfg.checkServerIdentity = (host, cert) => {
-      dlog('TLS checkServerIdentity host=', host, 'subject=', cert?.subject, 'issuer=', cert?.issuer);
-      return undefined;
+log('DB target -> host:', HOSTNAME, 'port:', PORT, 'path:', parsed?.pathname);
+
+function sslForHost(hostname) {
+  // Para Supabase, usar SNI e desabilitar verificação da cadeia (pooler usa cert intermediário/self-signed)
+  if (/\.(supabase\.co|supabase\.com)$/i.test(hostname || '')) {
+    return {
+      rejectUnauthorized: false,
+      servername: hostname,
+      // evita Node tentar validar CN/SAN e derrubar com SELF_SIGNED_CERT_IN_CHAIN
+      checkServerIdentity: () => undefined,
     };
-    return cfg;
   }
+
+  // Para outros provedores, respeite PGSSLMODE (disable/allow/no-verify/require)
+  const mode = String(env.PGSSLMODE || 'require').trim().toLowerCase();
   if (mode === 'disable' || mode === 'allow') return false;
-  return { rejectUnauthorized: mode !== 'no-verify', servername };
+  if (mode === 'no-verify') return { rejectUnauthorized: false, servername: hostname };
+  return { rejectUnauthorized: true, servername: hostname };
 }
 
-// DNS lookup only-IPv4 + logs
-const lookup = (hostname, _opts, cb) => {
-  const started = Date.now();
-  dlog('DNS lookup (IPv4) start:', hostname);
-  dns.lookup(hostname, { family: 4, hints: dns.ADDRCONFIG }, (err, addr, fam) => {
-    const ms = Date.now() - started;
-    if (err) {
-      warn('DNS lookup error:', hostname, err.code || err.message, `(${ms}ms)`);
-      return cb(err);
-    }
-    dlog('DNS lookup ok:', hostname, '->', addr, 'fam=', fam, `(${ms}ms)`);
-    cb(null, addr, fam);
-  });
-};
-
 const poolCfg = {
-  connectionString: RAW_URL,                 // NÃO muda host/porta
-  ssl: sslFor(RAW_URL),
-  lookup,                                    // força IPv4
+  connectionString: CLEAN_URL,
+  ssl: sslForHost(HOSTNAME),
+  // NÃO forçar IPv4 aqui (deixe o Node resolver melhor rota)
   max: Number(env.PG_MAX || 10),
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: Number(env.DB_CONN_TIMEOUT_MS || 2000),
   keepAlive: true,
+
   // timeouts opcionais do driver (0 = off). Descomente se quiser:
   // statement_timeout: 0,
   // query_timeout: 0,
@@ -83,8 +80,10 @@ const poolCfg = {
 };
 
 dlog('Pool config resumida:', {
-  url: safe(RAW_URL),
-  ssl: poolCfg.ssl && { rejectUnauthorized: poolCfg.ssl.rejectUnauthorized, servername: poolCfg.ssl.servername },
+  url: safe(CLEAN_URL),
+  ssl: poolCfg.ssl && typeof poolCfg.ssl === 'object'
+    ? { rejectUnauthorized: poolCfg.ssl.rejectUnauthorized, servername: poolCfg.ssl.servername }
+    : poolCfg.ssl, // false quando ssl desabilitado
   max: poolCfg.max,
   connTimeoutMs: poolCfg.connectionTimeoutMillis,
   idleTimeoutMs: poolCfg.idleTimeoutMillis,
@@ -95,7 +94,7 @@ let pool = null;
 let healthTimer = null;
 
 function describeError(e) {
-  const out = {
+  return {
     message: e?.message,
     code: e?.code,
     errno: e?.errno,
@@ -109,21 +108,20 @@ function describeError(e) {
     port: e?.port,
     stack: e?.stack,
   };
-  return out;
 }
 
 async function connectOnce() {
   const started = Date.now();
-  log('Conectando ao Postgres...', safe(RAW_URL));
+  log('Conectando ao Postgres...', safe(CLEAN_URL));
   const p = new pg.Pool(poolCfg);
 
   // Eventos do pool
-  p.on('connect', (client) => dlog('pool: connect (nova conexão criada)'));
+  p.on('connect', () => dlog('pool: connect (nova conexão criada)'));
   p.on('acquire', () => dlog('pool: acquire (cliente entregue ao caller)'));
   p.on('remove', () => dlog('pool: remove (cliente removido do pool)'));
   p.on('error', (e) => error('pool: error ->', describeError(e)));
 
-  // Instrumenta queries para medir tempo
+  // Wrap para logar tempo de query
   const _query = p.query.bind(p);
   p.query = async (text, params) => {
     const qid = Math.random().toString(36).slice(2, 8);
@@ -143,14 +141,11 @@ async function connectOnce() {
     }
   };
 
-  // Teste de conexão
+  // Teste de conexão (simples e rápido)
   try {
     const pingStart = Date.now();
-    const r = await p.query('SELECT version(), current_database(), inet_server_addr()::text as addr, inet_server_port() as port');
-    const ms = Date.now() - pingStart;
-    const row = r?.rows?.[0] || {};
-    log(`Conectado (${Date.now() - started}ms) db=${row.current_database} server=${row.addr}:${row.port}`);
-    dlog('server version:', row.version);
+    await p.query('SELECT 1');
+    log(`Conectado (${Date.now() - started}ms), ping=${Date.now() - pingStart}ms`);
   } catch (e) {
     error('Falhou ping inicial:', describeError(e));
     try { await p.end(); } catch {}
