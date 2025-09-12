@@ -1,10 +1,15 @@
+// src/routes/payments.js
 import express from 'express';
 import { query } from '../db/pg.js';
 import { createPixPayment, getPayment } from '../payments/mercadopago.js';
 
 const router = express.Router();
 
-// Auth mínimo: usa req.user se existir; para teste defina DISABLE_AUTH=1
+/* ---------- Auth "mínima" ----------
+   - Se houver req.user (middleware real), usa.
+   - Para teste sem auth, defina DISABLE_AUTH=1 e (opcionalmente) envie:
+     x-user-id, x-user-email, x-user-name
+------------------------------------ */
 function resolveUser(req) {
   if (req.user) return req.user;
   if (process.env.DISABLE_AUTH === '1') {
@@ -29,12 +34,14 @@ function requireAuth(req, res, next) {
  * body: { reservationId: string }
  * resp: { id,status,qr_code,qr_code_base64,expires_in }
  */
-router.post('/api/payments/pix', requireAuth, express.json(), async (req, res, next) => {
+router.post('/api/payments/pix', requireAuth, async (req, res, next) => {
   try {
     const { reservationId } = req.body || {};
-    if (!reservationId) return res.status(400).json({ error: 'reservationId obrigatório' });
+    if (!reservationId) {
+      return res.status(400).json({ error: 'reservationId obrigatório' });
+    }
 
-    // 1) Carrega a reserva (sem depender de 'amount')
+    // 1) Carrega reserva (sem depender de coluna amount)
     const rRes = await query(
       `select id, user_id, status, numbers
          from reservations
@@ -44,12 +51,12 @@ router.post('/api/payments/pix', requireAuth, express.json(), async (req, res, n
     const r = rRes.rows[0];
     if (!r) return res.status(404).json({ error: 'reserva não encontrada' });
 
-    // Se houver user_id salvo na reserva e houver id no token, exige que coincidam
+    // Se a reserva já tem user_id e o token também, exige que coincidam
     if (r.user_id && req.user.id && String(r.user_id) !== String(req.user.id)) {
       return res.status(403).json({ error: 'forbidden' });
     }
 
-    if (r.status && !['pendente','reservado',null,'active'].includes(r.status)) {
+    if (r.status && !['pendente', 'reservado', null, 'active'].includes(r.status)) {
       return res.status(409).json({ error: `reserva com status ${r.status}` });
     }
 
@@ -57,7 +64,7 @@ router.post('/api/payments/pix', requireAuth, express.json(), async (req, res, n
     const qty = Array.isArray(r.numbers) ? r.numbers.length : 0;
     if (!qty) return res.status(400).json({ error: 'reserva sem números' });
 
-    // PRICE_CENTS (ex: 5500) -> BRL
+    // PRICE_CENTS (ex.: 5500) -> BRL
     const unitCents = Number(process.env.PRICE_CENTS || 0);
     const unitBRL = unitCents ? unitCents / 100 : Number(process.env.NUMBER_PRICE || 55);
     const amount = +(qty * unitBRL).toFixed(2);
@@ -73,7 +80,7 @@ router.post('/api/payments/pix', requireAuth, express.json(), async (req, res, n
       last_name: name.split(' ').slice(1).join(' ') || undefined,
     };
 
-    // 4) Cria o PIX no Mercado Pago
+    // 4) Cria o pagamento PIX no Mercado Pago
     const pay = await createPixPayment({
       amount,
       description: `Reserva ${reservationId}`,
@@ -91,7 +98,7 @@ router.post('/api/payments/pix', requireAuth, express.json(), async (req, res, n
       [reservationId, pay.paymentId, pay.status, pay.raw]
     );
 
-    // 6) Atualiza status da reserva para 'pendente'
+    // 6) Atualiza status da reserva para pendente
     await query(
       `update reservations
           set status = 'pendente'
@@ -121,13 +128,13 @@ router.get('/api/payments/:id/status', requireAuth, async (req, res, next) => {
     const { id } = req.params;
     const p = await getPayment(id);
 
-    // cacheia status
+    // Cacheia status no banco
     await query(
       `update payments set status = $2, payload = $3 where mp_payment_id = $1`,
       [p.paymentId, p.status, p.raw]
     );
 
-    // se aprovado, marca reserva como paga
+    // Se aprovado, marca reserva como paga
     if (p.status === 'approved') {
       const rRes = await query(
         `select reservation_id from payments where mp_payment_id = $1`,
@@ -139,26 +146,14 @@ router.get('/api/payments/:id/status', requireAuth, async (req, res, next) => {
       }
     }
 
-    res.json({ paymentId: p.paymentId, status: p.status, status_detail: p.status_detail });
+    res.json({
+      paymentId: p.paymentId,
+      status: p.status,
+      status_detail: p.status_detail,
+    });
   } catch (err) {
     next(err);
   }
 });
-
-// pegue a reserva e a quantidade de números a partir do array
-const rRes = await query(
-  `select id, user_id, status, array_length(numbers,1)::int as qty
-     from reservations
-    where id = $1`,
-  [reservationId]
-);
-const r = rRes.rows[0];
-if (!r) return res.status(404).json({ error: 'reserva não encontrada' });
-
-// preço unitário: PRICE_CENTS/100 (ex.: 5500 => 55.00)
-const unit = Number(process.env.PRICE_CENTS || 5500) / 100;
-const amount = Number((r.qty * unit).toFixed(2));
-if (!amount) return res.status(400).json({ error: 'valor (amount) não definido' });
-
 
 export default router;
