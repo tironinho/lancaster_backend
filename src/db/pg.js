@@ -9,71 +9,96 @@ function ts() {
   const d = new Date();
   return d.toISOString().replace('T', ' ').replace('Z', '');
 }
-function log(...a)     { console.log(`[db ${ts()}]`, ...a); }
-function warn(...a)    { console.warn(`[db ${ts()}]`, ...a); }
-function error(...a)   { console.error(`[db ${ts()}]`, ...a); }
-function dlog(...a)    { if (DEBUG) console.log(`[db:debug ${ts()}]`, ...a); }
-const safe = (u) => String(u).replace(/:[^@/]+@/, '://***:***@');
+function log(...a)   { console.log(`[db ${ts()}]`, ...a); }
+function warn(...a)  { console.warn(`[db ${ts()}]`, ...a); }
+function error(...a) { console.error(`[db ${ts()}]`, ...a); }
+function dlog(...a)  { if (DEBUG) console.log(`[db:debug ${ts()}]`, ...a); }
+const safe = (u) => String(u || '').replace(/:[^@/]+@/, '://***:***@');
 
-const RAW_URL = String(env.DATABASE_URL || '').replace(/^['"]|['"]$/g, '');
-if (!RAW_URL) error('DATABASE_URL ausente');
-
-let parsed = null;
-try {
-  parsed = new NodeURL(RAW_URL);
-  dlog('DATABASE_URL parsed:', {
-    protocol: parsed.protocol,
-    host: parsed.hostname,
-    port: parsed.port,
-    pathname: parsed.pathname,
-    search: parsed.search,
-  });
-} catch (e) {
-  warn('Não consegui parsear DATABASE_URL:', e.message);
+/** Constrói uma URL a partir de PG* se não houver DATABASE_URL */
+function buildUrlFromPgVars() {
+  const host = env.PGHOST;
+  const port = env.PGPORT || '5432';
+  const user = env.PGUSER || 'postgres';
+  const pass = env.PGPASSWORD || '';
+  const db   = env.PGDATABASE || 'postgres';
+  if (!host) return '';
+  const passEnc = encodeURIComponent(pass);
+  // força sslmode=require; o objeto ssl controla verificação
+  return `postgres://` +
+         `${encodeURIComponent(user)}:${passEnc}` +
+         `@${host}:${port}/${encodeURIComponent(db)}?sslmode=require`;
 }
 
-// Limpa sslmode da URL e extrai host/porta só para log
-let CLEAN_URL = RAW_URL;
-let HOSTNAME = null;
-let PORT = null;
-try {
-  const u = new NodeURL(RAW_URL);
-  u.searchParams.delete('sslmode');   // evita conflito com objeto ssl abaixo
-  CLEAN_URL = u.toString();
-  HOSTNAME = u.hostname;
-  PORT = u.port || '5432';
-} catch {}
+/** Normaliza esquemas e limpa query params conflitantes */
+function normalizePgUrl(rawInput) {
+  let raw = String(rawInput || '').replace(/^['"]|['"]$/g, '').trim();
 
-log('DB target -> host:', HOSTNAME, 'port:', PORT, 'path:', parsed?.pathname);
+  // remove esquemas duplicados e unifica para postgres://
+  raw = raw.replace(/^postgresql:\/\/postgres:\/\//i, 'postgres://');
+  raw = raw.replace(/^postgres:\/\/postgres:\/\//i,    'postgres://');
+  raw = raw.replace(/^postgresql:\/\//i,               'postgres://');
 
+  // tenta parsear e remover sslmode da query (vamos usar objeto ssl)
+  try {
+    const u = new NodeURL(raw);
+    u.searchParams.delete('sslmode');
+    return {
+      cleanUrl: u.toString(),
+      host: u.hostname || null,
+      port: u.port || '5432',
+      pathname: u.pathname || null,
+    };
+  } catch (e) {
+    warn('Não consegui parsear DATABASE_URL:', e.message);
+    return { cleanUrl: raw, host: null, port: null, pathname: null };
+  }
+}
+
+/** SSL adequado ao host */
 function sslForHost(hostname) {
-  // Para Supabase, usar SNI e desabilitar verificação da cadeia (pooler usa cert intermediário/self-signed)
+  // Supabase: SNI + sem validar cadeia (pooler usa intermediário)
   if (/\.(supabase\.co|supabase\.com)$/i.test(hostname || '')) {
     return {
       rejectUnauthorized: false,
       servername: hostname,
-      // evita Node tentar validar CN/SAN e derrubar com SELF_SIGNED_CERT_IN_CHAIN
       checkServerIdentity: () => undefined,
     };
   }
 
-  // Para outros provedores, respeite PGSSLMODE (disable/allow/no-verify/require)
+  // Outros provedores: honrar PGSSLMODE se desejado
   const mode = String(env.PGSSLMODE || 'require').trim().toLowerCase();
-  if (mode === 'disable' || mode === 'allow') return false;
+  if (mode === 'disable' || mode === 'allow') return false; // sem TLS
   if (mode === 'no-verify') return { rejectUnauthorized: false, servername: hostname };
-  return { rejectUnauthorized: true, servername: hostname };
+  return { rejectUnauthorized: true, servername: hostname }; // require
+}
+
+/** ---- Resolução de URL de conexão ---- */
+const RAW_URL_INPUT =
+  (env.DATABASE_URL && String(env.DATABASE_URL)) ||
+  (env.POSTGRES_URL && String(env.POSTGRES_URL)) ||
+  (env.POSTGRES_PRISMA_URL && String(env.POSTGRES_PRISMA_URL)) ||
+  (env.POSTGRES_URL_NON_POOLING && String(env.POSTGRES_URL_NON_POOLING)) ||
+  buildUrlFromPgVars();
+
+if (!RAW_URL_INPUT) error('DATABASE_URL ausente (ou PG* não definidos)');
+
+const { cleanUrl: CLEAN_URL, host: HOSTNAME, port: PORT, pathname } = normalizePgUrl(RAW_URL_INPUT);
+
+log('DB target -> host:', HOSTNAME, 'port:', PORT, 'path:', pathname);
+
+/** Aviso útil: serverless + Supabase devem usar POOLER 6543 */
+if (process.env.VERCEL && /\.supabase\.co$/i.test(HOSTNAME || '') && PORT === '5432') {
+  warn('Você está usando host direto 5432 no Vercel. Prefira o POOLER 6543 (aws-1-sa-east-1.pooler.supabase.com).');
 }
 
 const poolCfg = {
   connectionString: CLEAN_URL,
   ssl: sslForHost(HOSTNAME),
-  // NÃO forçar IPv4 aqui (deixe o Node resolver melhor rota)
   max: Number(env.PG_MAX || 10),
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: Number(env.DB_CONN_TIMEOUT_MS || 2000),
   keepAlive: true,
-
-  // timeouts opcionais do driver (0 = off). Descomente se quiser:
   // statement_timeout: 0,
   // query_timeout: 0,
   // idle_in_transaction_session_timeout: 0,
@@ -83,7 +108,7 @@ dlog('Pool config resumida:', {
   url: safe(CLEAN_URL),
   ssl: poolCfg.ssl && typeof poolCfg.ssl === 'object'
     ? { rejectUnauthorized: poolCfg.ssl.rejectUnauthorized, servername: poolCfg.ssl.servername }
-    : poolCfg.ssl, // false quando ssl desabilitado
+    : poolCfg.ssl,
   max: poolCfg.max,
   connTimeoutMs: poolCfg.connectionTimeoutMillis,
   idleTimeoutMs: poolCfg.idleTimeoutMillis,
@@ -112,7 +137,14 @@ function describeError(e) {
 
 async function connectOnce() {
   const started = Date.now();
-  log('Conectando ao Postgres...', safe(CLEAN_URL));
+  // log sem credenciais
+  try {
+    const u = new NodeURL(CLEAN_URL);
+    log('Conectando ao Postgres ->', `${u.hostname}:${u.port || ''}${u.pathname}`);
+  } catch {
+    log('Conectando ao Postgres ->', safe(CLEAN_URL));
+  }
+
   const p = new pg.Pool(poolCfg);
 
   // Eventos do pool
@@ -121,7 +153,7 @@ async function connectOnce() {
   p.on('remove', () => dlog('pool: remove (cliente removido do pool)'));
   p.on('error', (e) => error('pool: error ->', describeError(e)));
 
-  // Wrap para logar tempo de query
+  // Wrap de query com medição/trace simples
   const _query = p.query.bind(p);
   p.query = async (text, params) => {
     const qid = Math.random().toString(36).slice(2, 8);
@@ -141,7 +173,7 @@ async function connectOnce() {
     }
   };
 
-  // Teste de conexão (simples e rápido)
+  // Ping inicial
   try {
     const pingStart = Date.now();
     await p.query('SELECT 1');
