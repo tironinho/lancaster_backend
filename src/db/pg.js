@@ -6,8 +6,17 @@ import { URL as NodeURL } from 'url';
 const RAW_URL = (process.env.DATABASE_URL || '').replace(/^['"]|['"]$/g, '');
 if (!RAW_URL) console.error('[pg] DATABASE_URL ausente');
 
-function buildConfig(urlStr) {
+function normalizeUrl(urlStr) {
   const u = new NodeURL(urlStr);
+  // se for pooler do Supabase e vier sem porta ou com 5432, força 6543
+  if (/\.(pooler\.supabase\.com)$/i.test(u.hostname)) {
+    if (!u.port || u.port === '5432') u.port = '6543';
+  }
+  return u;
+}
+
+function buildConfig(urlStr) {
+  const u = normalizeUrl(urlStr);
   const [database] = (u.pathname || '/postgres').slice(1).split('/');
 
   return {
@@ -17,9 +26,8 @@ function buildConfig(urlStr) {
     user: decodeURIComponent(u.username || ''),
     password: decodeURIComponent(u.password || ''),
     ssl: {
-      // aceita a cadeia autoassinada do pooler + SNI correto
-      rejectUnauthorized: false,
-      servername: u.hostname,
+      rejectUnauthorized: false,      // evita SELF_SIGNED_CERT_IN_CHAIN
+      servername: u.hostname,         // SNI correto
     },
     // Render é IPv4-only
     lookup: (hostname, _opts, cb) =>
@@ -41,7 +49,7 @@ function logSafe() {
 export async function getPool() {
   if (!pool) {
     const p = new pg.Pool(poolCfg);
-    await p.query('SELECT 1'); // falha rápido se algo estiver errado
+    await p.query('SELECT 1');
     console.log('[pg] connected to', logSafe());
     p.on('error', (e) => {
       console.error('[pg] pool error', e.code || e.message || e);
