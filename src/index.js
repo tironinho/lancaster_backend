@@ -1,7 +1,7 @@
 // src/index.js
 import 'dotenv/config';
-import dns from 'dns';
-try { dns.setDefaultResultOrder('ipv4first'); } catch {}
+import * as nodeDns from 'dns';
+try { nodeDns.setDefaultResultOrder?.('ipv4first'); } catch {}
 
 import express from 'express';
 import cors from 'cors';
@@ -14,18 +14,15 @@ import meRoutes from './routes/me.js';
 import drawsRoutes from './routes/draws.js';
 import drawsExtRoutes from './routes/draws_ext.js';
 import adminRoutes from './routes/admin.js';
-import dns from 'dns';
 
-import paymentsRouter from './routes/payments.js'; // NOVO router do PIX
+import paymentsRouter from './routes/payments.js';
 import { query, getPool } from './db/pg.js';
 
 const app = express();
 const PORT = process.env.PORT || 4000;
 const ORIGIN = process.env.CORS_ORIGIN || '*';
 
-try { dns.setDefaultResultOrder('ipv4first'); } catch {}
-
-// Middlewares (antes das rotas)
+// Middlewares
 app.use(cors({
   origin: ORIGIN === '*' ? true : ORIGIN.split(',').map(s => s.trim()),
   credentials: true,
@@ -39,7 +36,7 @@ app.get('/health', (_req, res) => {
 });
 
 // Rotas
-app.use(paymentsRouter); // o router já define /api/payments/...
+app.use(paymentsRouter);
 app.use('/api/auth', authRoutes);
 app.use('/api/numbers', numbersRoutes);
 app.use('/api/reservations', reservationsRoutes);
@@ -53,7 +50,12 @@ app.use((req, res) => {
   res.status(404).json({ error: 'not_found', path: req.originalUrl });
 });
 
-
+// DB health ping
+setInterval(() => {
+  query('SELECT 1').catch(e =>
+    console.warn('[health] db ping failed', e.code || e.message)
+  );
+}, 60_000);
 
 app.listen(PORT, async () => {
   console.log(`API listening on :${PORT}`);
