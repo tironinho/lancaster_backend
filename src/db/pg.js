@@ -16,12 +16,12 @@ function buildConfig(urlStr) {
     database,
     user: decodeURIComponent(u.username || ''),
     password: decodeURIComponent(u.password || ''),
-    // SSL: confia no certificado autoassinado do pooler + SNI correto
     ssl: {
+      // aceita a cadeia autoassinada do pooler + SNI correto
       rejectUnauthorized: false,
       servername: u.hostname,
     },
-    // força IPv4 no Render
+    // Render é IPv4-only
     lookup: (hostname, _opts, cb) =>
       dns.lookup(hostname, { family: 4, hints: dns.ADDRCONFIG }, cb),
     max: Number(process.env.PG_MAX || 10),
@@ -35,15 +35,13 @@ const poolCfg = buildConfig(RAW_URL);
 let pool = null;
 
 function logSafe() {
-  const h = `${poolCfg.host}:${poolCfg.port}`;
-  return h.replace(/:[^@]+@/, '://***:***@');
+  return `${poolCfg.host}:${poolCfg.port}`;
 }
 
 export async function getPool() {
   if (!pool) {
     const p = new pg.Pool(poolCfg);
-    // falha rápido se algo estiver errado
-    await p.query('SELECT 1');
+    await p.query('SELECT 1'); // falha rápido se algo estiver errado
     console.log('[pg] connected to', logSafe());
     p.on('error', (e) => {
       console.error('[pg] pool error', e.code || e.message || e);
