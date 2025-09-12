@@ -33,17 +33,19 @@ try {
   warn('Não consegui parsear DATABASE_URL:', e.message);
 }
 
+// depois de: parsed = new NodeURL(RAW_URL)
+log('DB target -> host:', parsed.hostname, 'port:', parsed.port || 5432, 'path:', parsed.pathname);
+
 function sslFor(url) {
   const mode = String(env.PGSSLMODE || 'require').trim().toLowerCase();
   let servername = null;
   try { servername = new NodeURL(url).hostname; } catch {}
   // Supabase: manter SNI e evitar chain error
   if (/\.(supabase\.co|supabase\.com)$/i.test(servername || '')) {
-    const cfg = { rejectUnauthorized: mode !== 'no-verify', servername };
-    // Para ver detalhes do handshake (apenas log; não bloqueia)
+    const cfg = { rejectUnauthorized: false, servername };
     cfg.checkServerIdentity = (host, cert) => {
       dlog('TLS checkServerIdentity host=', host, 'subject=', cert?.subject, 'issuer=', cert?.issuer);
-      return undefined; // não rejeita
+      return undefined;
     };
     return cfg;
   }

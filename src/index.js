@@ -1,6 +1,7 @@
 // src/index.js
 import 'dotenv/config';
 import * as nodeDns from 'dns';
+import { runDbDialSelfTest } from './debug/netcheck.js';
 try { nodeDns.setDefaultResultOrder?.('ipv4first'); } catch {}
 
 import express from 'express';
@@ -67,5 +68,43 @@ app.listen(PORT, async () => {
     console.error('[db] initial check failed:', e);
   }
 });
+
+// ...dentro do bootstrap async (antes ou logo após app.listen):
+(async () => {
+  console.log('[diag] starting TCP dial self-test to Postgres…');
+  const diag = await runDbDialSelfTest(process.env.DATABASE_URL);
+  console.log('[diag] tcp-dial result =', JSON.stringify(diag, null, 2));
+
+  // opcional: tentar um SELECT 1 e logar resultado/erro claramente
+  try {
+    const p = await getPool();
+    const r = await p.query('select 1 as ok');
+    console.log('[diag] SELECT 1 ok ->', r.rows[0]);
+  } catch (e) {
+    console.error('[diag] SELECT 1 FAIL ->', e.code || e.message, e);
+  }
+})();
+
+app.get('/__diag/db', async (_req, res) => {
+  try {
+    const diag = await runDbDialSelfTest(process.env.DATABASE_URL);
+    let ping = null;
+    try {
+      const p = await getPool();
+      const r = await p.query('select inet_server_addr()::text addr, inet_server_port() port, current_database() db');
+      ping = r.rows[0] || null;
+    } catch (e) {
+      ping = { error: e.code || e.message };
+    }
+    res.json({ env: {
+      PGSSLMODE: process.env.PGSSLMODE || 'require',
+      PG_MAX: process.env.PG_MAX || '10',
+      DB_CONN_TIMEOUT_MS: process.env.DB_CONN_TIMEOUT_MS || '2000',
+    }, tcp: diag, ping });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 
 export default app;
